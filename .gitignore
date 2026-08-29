@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Entornos y credenciales locales (por si alguna vez se crean aqui)
+.env
+*.pem
