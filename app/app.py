@@ -2,41 +2,55 @@ from flask import Flask, request, jsonify, render_template_string
 import boto3
 import uuid
 from botocore.client import Config
+from botocore.exceptions import ClientError
 import pg8000.native
+# date y timedelta se usan para calcular los rangos de fechas de las
+# consultas nuevas del panel (ultimos 30 dias, dia de hoy, etc.) sin
+# depender de que el usuario escriba las fechas a mano.
+from datetime import date, timedelta
 
 app = Flask(__name__)
 s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+
+
+# Formatea un numero al estilo colombiano: punto como separador de miles y
+# coma como separador decimal (ej. 1500000.5 -> "1.500.000,50"). Python no
+# tiene un formato local para esto sin instalar dependencias adicionales
+# (el modulo "locale" existiria, pero depende de que el sistema operativo
+# tenga el locale es_CO instalado, algo fragil de garantizar en un
+# servidor). En vez de eso, se genera el numero en formato estadounidense
+# (coma para miles, punto para decimales) y se intercambian los dos
+# simbolos usando un marcador temporal, para no pisar uno con el otro a
+# mitad de camino.
+def formatear_numero(valor, decimales=2):
+    texto_formato = '{:,.' + str(decimales) + 'f}'
+    texto_us = texto_formato.format(valor)
+    texto_co = texto_us.replace(',', '§').replace('.', ',').replace('§', '.')
+    return texto_co
+
+
+# Registra formatear_numero como un filtro de Jinja llamado "cop", para
+# poder usarlo directamente en las plantillas HTML como {{ valor | cop }}.
+app.jinja_env.filters['cop'] = formatear_numero
 
 # Cliente de SSM Parameter Store -- se crea una sola vez, a nivel de modulo,
 # para no reconstruirlo en cada peticion HTTP.
 ssm = boto3.client('ssm', region_name='us-east-1')
 
-# --- Valores especificos de esta instalacion -------------------------------
-# Reemplaza estos dos valores con los de tu propia cuenta de AWS antes de
-# desplegar. Ninguno de los dos es un secreto (no dan acceso por si solos:
-# el bucket exige credenciales de IAM y RDS esta en una subred privada sin
-# acceso publico), pero son identificadores propios de una cuenta real y no
-# se dejan como valores fijos en un repositorio publico.
 BUCKET_NAME = 'facturas-microempresarios-<TU-CUENTA-AWS>'  # Consola S3 > nombre del bucket
-DB_HOST = '<TU-ENDPOINT-RDS>.rds.amazonaws.com'            # Consola RDS > Bases de datos > Punto de enlace (endpoint)
-# -----------------------------------------------------------------------
-
+DB_HOST = '<TU-ENDPOINT-RDS>.rds.amazonaws.com'  # Consola RDS > Bases de datos > Punto de enlace (endpoint)
 DB_PORT = 5432
 DB_NAME = 'facturas'
 DB_USER = 'postgres'
 
-# La contraseña no esta escrita aqui: se consulta a SSM Parameter Store una
-# sola vez, cuando la aplicacion arranca. WithDecryption=True le dice a SSM
-# que use la llave KMS asociada para devolver el valor real. El parametro
-# '/facturas-app/rds-password' debe existir en tu cuenta como SecureString
-# antes de arrancar la aplicacion.
+# La contraseña ya no esta escrita aqui: se consulta a SSM Parameter Store
+# una sola vez, cuando la aplicacion arranca. WithDecryption=True le dice a
+# SSM que use la llave KMS asociada para devolver el valor real.
 DB_PASSWORD = ssm.get_parameter(
     Name='/facturas-app/rds-password',
     WithDecryption=True
 )['Parameter']['Value']
 
-# HTML de la pagina principal: un formulario simple para tomar/seleccionar
-# una foto de la factura, comprimirla en el navegador y subirla a S3.
 PAGINA_HTML = """
 <!DOCTYPE html>
 <html lang="es">
@@ -56,19 +70,30 @@ PAGINA_HTML = """
 <body>
     <h1>Digitalizar factura</h1>
     <p>Toma una foto de tu factura o recibo:</p>
-    <input type="file" id="archivo" accept="image/*" capture="environment">
+    <input type="file" id="archivo" accept="image/*,application/pdf" capture="environment">
     <button onclick="subirFactura()">Subir factura</button>
     <div id="estado"></div>
     <a class="enlace-panel" href="/facturas">Ver facturas procesadas &rarr;</a>
+    <a class="enlace-panel" href="/registrar-venta">Registrar venta del dia &rarr;</a>
+    <a class="enlace-panel" href="/panel">Ver panel de gestion &rarr;</a>
+    <a class="enlace-panel" href="/asistente">Preguntale a tu negocio &rarr;</a>
     <script>
-        // Redimensiona la imagen a un ancho maximo de 1600px y la reexporta
-        // como JPEG de calidad 0.8, para no subir fotos de varios MB desde
-        // el celular y acelerar tanto la subida como el procesamiento.
+        // Comprime y redimensiona una foto antes de subirla, usando un
+        // <canvas> del navegador. Esto SOLO funciona con imagenes de verdad
+        // (JPEG, PNG, etc.) -- un <img> del navegador no puede decodificar
+        // un PDF, asi que si se le pasa un PDF, img.src nunca dispara
+        // onload (ni onerror, sin el manejo de abajo), y la Promise se
+        // queda esperando para siempre. Por eso subirFactura() de abajo
+        // nunca llama a esta funcion con un PDF -- lo sube tal cual.
+        // Se agrega tambien un manejo de error explicito (antes no existia)
+        // para el caso de un archivo de imagen corrupto o no reconocido,
+        // que antes se habria quedado colgado de la misma forma.
         function comprimirImagen(archivo) {
-            return new Promise((resolve) => {
+            return new Promise((resolve, reject) => {
                 const img = new Image();
                 const lector = new FileReader();
                 lector.onload = (e) => {
+                    img.onerror = () => reject(new Error('No se pudo leer la imagen.'));
                     img.src = e.target.result;
                     img.onload = () => {
                         const anchoMax = 1600;
@@ -83,12 +108,10 @@ PAGINA_HTML = """
                         }, 'image/jpeg', 0.8);
                     };
                 };
+                lector.onerror = () => reject(new Error('No se pudo leer el archivo.'));
                 lector.readAsDataURL(archivo);
             });
         }
-        // Flujo completo de subida: comprime la imagen, pide una URL
-        // prefirmada de S3 al backend, y sube el archivo directo a S3 con
-        // esa URL -- el archivo nunca pasa por este servidor Flask.
         async function subirFactura() {
             const input = document.getElementById('archivo');
             const estado = document.getElementById('estado');
@@ -97,9 +120,23 @@ PAGINA_HTML = """
                 return;
             }
             const archivoOriginal = input.files[0];
-            estado.textContent = 'Optimizando imagen...';
-            const archivo = await comprimirImagen(archivoOriginal);
-            estado.textContent = 'Preparando subida...';
+            let archivo;
+            try {
+                if (archivoOriginal.type === 'application/pdf') {
+                    // Un PDF se sube tal cual, sin pasar por comprimirImagen
+                    // -- ese paso es exclusivo de fotos y con un PDF nunca
+                    // terminaria (ver el comentario de la funcion).
+                    estado.textContent = 'Preparando subida...';
+                    archivo = archivoOriginal;
+                } else {
+                    estado.textContent = 'Optimizando imagen...';
+                    archivo = await comprimirImagen(archivoOriginal);
+                    estado.textContent = 'Preparando subida...';
+                }
+            } catch (error) {
+                estado.textContent = 'No se pudo procesar el archivo seleccionado.';
+                return;
+            }
             const respuestaUrl = await fetch('/get-upload-url?filename=' + encodeURIComponent(archivo.name));
             const datos = await respuestaUrl.json();
             estado.textContent = 'Subiendo a S3...';
@@ -119,8 +156,6 @@ PAGINA_HTML = """
 </html>
 """
 
-# HTML del panel de consulta: recorre las facturas guardadas en RDS (mas
-# recientes primero) y, para cada una, su tabla de items.
 PANEL_HTML = """
 <!DOCTYPE html>
 <html lang="es">
@@ -134,6 +169,7 @@ PANEL_HTML = """
         .factura { border: 1px solid #ddd; border-radius: 8px; padding: 14px; margin-bottom: 16px; }
         .factura h3 { margin: 0 0 6px 0; }
         .factura .total { color: #FF9900; font-weight: bold; font-size: 18px; }
+        .factura .impuesto { color: #555; font-size: 14px; margin-top: -4px; }
         .factura table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
         .factura th, .factura td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #eee; }
         .vacio { color: #777; }
@@ -150,15 +186,21 @@ PANEL_HTML = """
     <div class="factura">
         <h3>{{ factura.proveedor_nombre or 'Proveedor no detectado' }}</h3>
         <p>Procesada: {{ factura.fecha_procesado }}</p>
-        <p class="total">Total: {{ factura.total }}</p>
+        <p class="total">Total: {% if factura.total is not none %}${{ factura.total | cop }}{% else %}sin total detectado{% endif %}</p>
+        {% if factura.impuesto is not none %}
+        <p class="impuesto">Impuesto: ${{ factura.impuesto | cop }}</p>
+        {% endif %}
+        {% if factura.imagen_url %}
+        <p><a href="{{ factura.imagen_url }}" target="_blank" rel="noopener">Ver imagen original de la factura</a></p>
+        {% endif %}
         <table>
             <tr><th>Descripcion</th><th>Cant.</th><th>Precio</th><th>Subtotal</th></tr>
             {% for item in factura.lineas %}
             <tr>
-                <td>{{ item.descripcion }}</td>
-                <td>{{ item.cantidad }}</td>
-                <td>{{ item.precio_unitario }}</td>
-                <td>{{ item.subtotal }}</td>
+                <td>{{ item.descripcion or '-' }}</td>
+                <td>{{ item.cantidad if item.cantidad is not none else '-' }}</td>
+                <td>{% if item.precio_unitario is not none %}${{ item.precio_unitario | cop }}{% else %}-{% endif %}</td>
+                <td>{% if item.subtotal is not none %}${{ item.subtotal | cop }}{% else %}-{% endif %}</td>
             </tr>
             {% endfor %}
         </table>
@@ -168,20 +210,14 @@ PANEL_HTML = """
 </html>
 """
 
-# Pagina principal: sirve el formulario de subida.
 @app.route('/')
 def index():
     return render_template_string(PAGINA_HTML)
 
-# Genera una URL prefirmada de S3 (valida 5 minutos) para que el navegador
-# suba el archivo directamente a S3, sin pasar por este servidor -- este
-# endpoint solo firma la URL, nunca recibe el archivo en si.
 @app.route('/get-upload-url')
 def get_upload_url():
     nombre_original = request.args.get('filename', 'factura.jpg')
     extension = nombre_original.split('.')[-1]
-    # Genera un nombre unico (UUID) para no sobreescribir archivos si dos
-    # usuarios suben una foto con el mismo nombre original.
     key = f"entrada/{uuid.uuid4()}.{extension}"
     upload_url = s3.generate_presigned_url(
         ClientMethod='put_object',
@@ -190,8 +226,6 @@ def get_upload_url():
     )
     return jsonify({'upload_url': upload_url, 'key': key})
 
-# Panel de consulta: lee de RDS todas las facturas ya procesadas por la
-# Lambda, junto con sus items, y las muestra en una pagina HTML simple.
 @app.route('/facturas')
 def ver_facturas():
     conexion = pg8000.native.Connection(
@@ -199,12 +233,17 @@ def ver_facturas():
         host=DB_HOST, port=DB_PORT, database=DB_NAME
     )
     try:
+        # s3_key ya se guarda desde la v1 (lambda_procesar_factura escribe
+        # esta columna en cada INSERT -- ver la Lambda), asi que no hizo
+        # falta ningun cambio de esquema ni de backfill para agregar esto:
+        # el dato de todas las facturas ya procesadas estaba disponible,
+        # solo no se estaba leyendo ni mostrando.
         filas_factura = conexion.run(
-            "SELECT factura_id, proveedor_nombre, total, fecha_procesado FROM factura ORDER BY fecha_procesado DESC"
+            "SELECT factura_id, proveedor_nombre, total, impuesto, fecha_procesado, s3_key FROM factura ORDER BY fecha_procesado DESC"
         )
         facturas = []
         for fila in filas_factura:
-            factura_id, proveedor, total, fecha_procesado = fila
+            factura_id, proveedor, total, impuesto, fecha_procesado, s3_key = fila
             filas_item = conexion.run(
                 "SELECT descripcion, cantidad, precio_unitario, subtotal FROM item_factura WHERE factura_id = :fid",
                 fid=factura_id
@@ -213,15 +252,1167 @@ def ver_facturas():
                 {'descripcion': i[0], 'cantidad': i[1], 'precio_unitario': i[2], 'subtotal': i[3]}
                 for i in filas_item
             ]
+            # Genera una URL firmada temporal para ver la imagen original en
+            # S3 -- el bucket no es publico, asi que sin esto el navegador
+            # no podria abrir la imagen directamente. generate_presigned_url
+            # no hace ninguna llamada de red (solo calcula una firma local),
+            # asi que hacerlo una vez por factura en este bucle no tiene
+            # costo de latencia real. Si por algun motivo una factura no
+            # tiene s3_key guardado (no deberia pasar, pero por seguridad),
+            # simplemente no se muestra el enlace para esa factura.
+            imagen_url = None
+            if s3_key:
+                imagen_url = s3.generate_presigned_url(
+                    ClientMethod='get_object',
+                    Params={'Bucket': BUCKET_NAME, 'Key': s3_key},
+                    ExpiresIn=3600
+                )
             facturas.append({
                 'proveedor_nombre': proveedor,
                 'total': total,
+                'impuesto': impuesto,
                 'fecha_procesado': fecha_procesado,
-                'lineas': lineas
+                'lineas': lineas,
+                'imagen_url': imagen_url
             })
         return render_template_string(PANEL_HTML, facturas=facturas)
     finally:
         conexion.close()
+
+
+# =====================================================================
+# A PARTIR DE AQUI: codigo nuevo de la version 2 (panel de gestion).
+# Nada de lo anterior se modifico. Todo lo de abajo lee de las mismas
+# tablas (factura, item_factura) mas la tabla nueva venta_diaria.
+# =====================================================================
+
+# ---- Lado GASTO (datos que ya existen, capturados por OCR/Textract) ----
+
+# Devuelve el gasto total por dia dentro de un rango de fechas (inclusive
+# en ambos extremos). "dia" se calcula a partir de fecha_procesado (cuando
+# se subio la factura), no de fecha_factura (la fecha impresa en el papel,
+# que Textract a veces no detecta) -- ver la nota de la bitacora sobre por
+# que se eligio asi. Pensada para la grafica de tendencia del panel.
+def obtener_gasto_por_dia(conexion, fecha_inicio, fecha_fin):
+    filas = conexion.run(
+        """
+        SELECT fecha_procesado::date AS dia, SUM(total) AS total_dia
+        FROM factura
+        WHERE fecha_procesado::date BETWEEN :inicio AND :fin
+        GROUP BY fecha_procesado::date
+        ORDER BY dia
+        """,
+        inicio=fecha_inicio,
+        fin=fecha_fin
+    )
+    return [{'dia': str(fila[0]), 'total': float(fila[1])} for fila in filas]
+
+
+# Devuelve las facturas (gastos) procesadas en un dia especifico.
+# Pensada para la lista "gastos de hoy" del panel.
+def obtener_facturas_de_un_dia(conexion, fecha):
+    filas = conexion.run(
+        """
+        SELECT factura_id, proveedor_nombre, total, fecha_procesado
+        FROM factura
+        WHERE fecha_procesado::date = :fecha
+        ORDER BY fecha_procesado DESC
+        """,
+        fecha=fecha
+    )
+    return [
+        {
+            'factura_id': fila[0],
+            'proveedor_nombre': fila[1] or 'Proveedor no detectado',
+            'total': float(fila[2]) if fila[2] is not None else None,
+            'fecha_procesado': str(fila[3])
+        }
+        for fila in filas
+    ]
+
+
+# Devuelve un resumen de una sola fila: cuantas facturas y cuanto gasto
+# total hay en un rango de fechas. Pensada para las cifras destacadas del
+# panel (ej. "5 facturas, $120.000 de gasto esta semana").
+def obtener_resumen_gasto(conexion, fecha_inicio, fecha_fin):
+    fila = conexion.run(
+        """
+        SELECT COUNT(*) AS cantidad_facturas,
+               COALESCE(SUM(total), 0) AS total_periodo
+        FROM factura
+        WHERE fecha_procesado::date BETWEEN :inicio AND :fin
+        """,
+        inicio=fecha_inicio,
+        fin=fecha_fin
+    )[0]
+    return {'cantidad_facturas': fila[0], 'total_periodo': float(fila[1])}
+
+
+# Devuelve los proveedores a los que mas se les ha comprado (por monto
+# total) dentro de un rango de fechas. Ignora las facturas donde Textract
+# no detecto el proveedor, porque agruparlas bajo "None" no aportaria
+# informacion util.
+#
+# NOTA (encontrada probando esta consulta con datos reales): Textract a
+# veces extrae el nombre del proveedor como un bloque de varias lineas
+# (ej. "SMALL\nHE\nRO" en vez de "SMALL HE RO"). Si se agrupara por el
+# texto exacto, el mismo proveedor quedaria partido en variantes distintas
+# solo por los saltos de linea. Por eso se agrupa por una version
+# "normalizada" del nombre: REGEXP_REPLACE(..., '\s+', ' ', 'g') convierte
+# cualquier secuencia de espacios/saltos de linea en un solo espacio, y
+# TRIM() quita espacios sobrantes al inicio/final.
+# Esto NO resuelve el caso distinto en que Textract extrae el mismo
+# proveedor real como dos textos genuinamente diferentes (ej. "La Esquina
+# del Real" vs "del Real Lit Esquina Restaurant") -- eso requeriria una
+# comparacion difusa entre nombres, que queda fuera de alcance por ahora y
+# se documenta como limitacion conocida, igual que las limitaciones de
+# Textract ya documentadas en la v1.
+def obtener_top_proveedores(conexion, fecha_inicio, fecha_fin, limite=5):
+    filas = conexion.run(
+        """
+        SELECT TRIM(REGEXP_REPLACE(proveedor_nombre, '\\s+', ' ', 'g')) AS proveedor,
+               COALESCE(SUM(total), 0) AS total_gastado,
+               COUNT(*) AS cantidad_facturas
+        FROM factura
+        WHERE fecha_procesado::date BETWEEN :inicio AND :fin
+          AND proveedor_nombre IS NOT NULL
+        GROUP BY TRIM(REGEXP_REPLACE(proveedor_nombre, '\\s+', ' ', 'g'))
+        ORDER BY total_gastado DESC
+        LIMIT :limite
+        """,
+        inicio=fecha_inicio,
+        fin=fecha_fin,
+        limite=limite
+    )
+    return [
+        {'proveedor': fila[0], 'total_gastado': float(fila[1]), 'cantidad_facturas': fila[2]}
+        for fila in filas
+    ]
+
+
+# Devuelve los items (productos o servicios) que mas se repiten dentro de
+# un rango de fechas, cruzando item_factura con factura para poder filtrar
+# por fecha. Util para detectar gasto recurrente (ej. "compro cajas todas
+# las semanas").
+def obtener_item_mas_frecuente(conexion, fecha_inicio, fecha_fin, limite=5):
+    filas = conexion.run(
+        """
+        SELECT i.descripcion, COUNT(*) AS veces, SUM(i.subtotal) AS total_gastado
+        FROM item_factura i
+        JOIN factura f ON f.factura_id = i.factura_id
+        WHERE f.fecha_procesado::date BETWEEN :inicio AND :fin
+          AND i.descripcion IS NOT NULL
+        GROUP BY i.descripcion
+        ORDER BY veces DESC
+        LIMIT :limite
+        """,
+        inicio=fecha_inicio,
+        fin=fecha_fin,
+        limite=limite
+    )
+    return [
+        {
+            'descripcion': fila[0],
+            'veces': fila[1],
+            'total_gastado': float(fila[2]) if fila[2] is not None else 0.0
+        }
+        for fila in filas
+    ]
+
+
+# Devuelve las facturas de un rango de fechas a las que les falto el
+# proveedor o el total (fallas de deteccion de Textract). No es una
+# pregunta de negocio sino de calidad de datos: le indica al usuario
+# cuales facturas conviene revisar o volver a subir con mejor foto.
+def obtener_facturas_incompletas(conexion, fecha_inicio, fecha_fin):
+    filas = conexion.run(
+        """
+        SELECT factura_id, proveedor_nombre, total, fecha_procesado
+        FROM factura
+        WHERE fecha_procesado::date BETWEEN :inicio AND :fin
+          AND (proveedor_nombre IS NULL OR total IS NULL)
+        ORDER BY fecha_procesado DESC
+        """,
+        inicio=fecha_inicio,
+        fin=fecha_fin
+    )
+    return [
+        {
+            'factura_id': fila[0],
+            'proveedor_nombre': fila[1],
+            'total': float(fila[2]) if fila[2] is not None else None,
+            'fecha_procesado': str(fila[3])
+        }
+        for fila in filas
+    ]
+
+
+# Compara el gasto de los ultimos 30 dias contra los 30 dias anteriores a
+# esos (dos ventanas moviles del mismo tamano, no meses calendario -- ver
+# la explicacion en la bitacora sobre por que se eligio asi). "hoy" se
+# recibe como parametro en vez de calcularse adentro, para que la funcion
+# sea facil de probar con una fecha fija si hiciera falta.
+def obtener_comparacion_periodos(conexion, hoy):
+    fin_actual = hoy
+    inicio_actual = hoy - timedelta(days=29)
+    fin_anterior = inicio_actual - timedelta(days=1)
+    inicio_anterior = fin_anterior - timedelta(days=29)
+
+    resumen_actual = obtener_resumen_gasto(conexion, inicio_actual, fin_actual)
+    resumen_anterior = obtener_resumen_gasto(conexion, inicio_anterior, fin_anterior)
+
+    gasto_actual = resumen_actual['total_periodo']
+    gasto_anterior = resumen_anterior['total_periodo']
+
+    # Si el periodo anterior no tuvo gasto registrado, calcular un
+    # porcentaje de variacion no tiene sentido (division por cero) -- se
+    # devuelve None en vez de una cifra inventada.
+    if gasto_anterior > 0:
+        variacion_porcentual = ((gasto_actual - gasto_anterior) / gasto_anterior) * 100
+    else:
+        variacion_porcentual = None
+
+    return {
+        'periodo_actual': {
+            'inicio': str(inicio_actual), 'fin': str(fin_actual), **resumen_actual
+        },
+        'periodo_anterior': {
+            'inicio': str(inicio_anterior), 'fin': str(fin_anterior), **resumen_anterior
+        },
+        'variacion_porcentual': variacion_porcentual
+    }
+
+
+# ---- Lado VENTA (dato nuevo, ingresado a mano por el microempresario) ----
+
+# Guarda o actualiza la venta total de un dia especifico. Si ya existia un
+# registro para esa fecha (por la restriccion UNIQUE de la tabla), lo
+# actualiza en vez de duplicarlo -- asi, si el usuario se equivoca y vuelve
+# a registrar el mismo dia, corrige el valor en vez de sumarlo dos veces.
+def registrar_venta_diaria(conexion, fecha, monto):
+    conexion.run(
+        """
+        INSERT INTO venta_diaria (fecha, monto)
+        VALUES (:fecha, :monto)
+        ON CONFLICT (fecha) DO UPDATE
+        SET monto = EXCLUDED.monto, fecha_registrado = NOW()
+        """,
+        fecha=fecha,
+        monto=monto
+    )
+
+
+# Devuelve la venta registrada por dia dentro de un rango de fechas.
+# Misma forma que obtener_gasto_por_dia(), para poder graficar ambas
+# series juntas en el mismo eje de tiempo.
+def obtener_venta_por_dia(conexion, fecha_inicio, fecha_fin):
+    filas = conexion.run(
+        "SELECT fecha, monto FROM venta_diaria WHERE fecha BETWEEN :inicio AND :fin ORDER BY fecha",
+        inicio=fecha_inicio,
+        fin=fecha_fin
+    )
+    return [{'dia': str(fila[0]), 'total': float(fila[1])} for fila in filas]
+
+
+# Compara el gasto total (de facturas) contra la venta total (registrada a
+# mano) de un mismo rango de fechas, y calcula un margen aproximado. Es
+# deliberadamente una aproximacion simple (venta menos gasto), no un
+# estado de resultados contable real -- para eso harian falta datos que
+# este proyecto no captura (impuestos, costos fijos, etc.).
+def obtener_comparacion_gasto_venta(conexion, fecha_inicio, fecha_fin):
+    gasto_total = obtener_resumen_gasto(conexion, fecha_inicio, fecha_fin)['total_periodo']
+
+    fila_venta = conexion.run(
+        "SELECT COALESCE(SUM(monto), 0) FROM venta_diaria WHERE fecha BETWEEN :inicio AND :fin",
+        inicio=fecha_inicio,
+        fin=fecha_fin
+    )[0]
+    venta_total = float(fila_venta[0])
+
+    margen_aproximado = venta_total - gasto_total
+
+    # Igual que con la variacion porcentual: si no hay venta registrada
+    # todavia, no se puede calcular que porcentaje representa el gasto
+    # sobre la venta -- se devuelve None en vez de una cifra inventada.
+    if venta_total > 0:
+        porcentaje_gasto_sobre_venta = (gasto_total / venta_total) * 100
+    else:
+        porcentaje_gasto_sobre_venta = None
+
+    return {
+        'gasto_total': gasto_total,
+        'venta_total': venta_total,
+        'margen_aproximado': margen_aproximado,
+        'porcentaje_gasto_sobre_venta': porcentaje_gasto_sobre_venta
+    }
+
+
+# ---- Ruta temporal de verificacion (se reemplaza por el panel visual) ----
+
+# ---- Panel visual (Chart.js) ----
+
+# Plantilla del panel de gestion. Usa Chart.js (cargado desde un CDN
+# publico, cdnjs) para dibujar una sola grafica de lineas con dos series
+# (gasto y venta por dia). El resto de la informacion (proveedores, items,
+# facturas incompletas) se muestra como tablas HTML normales -- no todo
+# necesita ser una grafica para ser util.
+PANEL_GESTION_HTML = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panel de gestion</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; color: #222; }
+        h1 { font-size: 22px; }
+        h2 { font-size: 17px; margin-top: 32px; }
+        .volver { display: inline-block; margin-bottom: 16px; color: #0066cc; }
+        .tarjetas { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+        .tarjeta { background: #f7f7f7; border: 1px solid #ddd; border-radius: 8px; padding: 14px 18px; min-width: 150px; flex: 1; }
+        .tarjeta .etiqueta { font-size: 12px; color: #666; text-transform: uppercase; }
+        .tarjeta .valor { font-size: 22px; font-weight: bold; margin-top: 4px; }
+        .valor.positivo { color: #1a7a1a; }
+        .valor.negativo { color: #c0392b; }
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 14px; }
+        th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
+        .vacio { color: #777; font-size: 14px; }
+        .aviso { background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: 10px 14px; font-size: 14px; margin-top: 8px; }
+    </style>
+</head>
+<body>
+    <a class="volver" href="/">&larr; Volver a subir factura</a>
+    <h1>Panel de gestion</h1>
+
+    <div class="tarjetas">
+        <div class="tarjeta">
+            <div class="etiqueta">Gasto de hoy</div>
+            <div class="valor">${{ resumen_gasto_hoy.total_periodo | cop }}</div>
+        </div>
+        <div class="tarjeta">
+            <div class="etiqueta">Venta de hoy</div>
+            <div class="valor">
+                {% if venta_hoy is not none %}${{ venta_hoy | cop }}{% else %}Sin registrar{% endif %}
+            </div>
+        </div>
+        <div class="tarjeta">
+            <div class="etiqueta">Margen aprox. (30 dias)</div>
+            <div class="valor {{ 'positivo' if comparacion_gasto_venta.margen_aproximado >= 0 else 'negativo' }}">
+                ${{ comparacion_gasto_venta.margen_aproximado | cop }}
+            </div>
+        </div>
+        <div class="tarjeta">
+            <div class="etiqueta">Gasto vs. 30 dias anteriores</div>
+            <div class="valor">
+                {% if comparacion_periodos.variacion_porcentual is none %}
+                    Sin datos previos
+                {% else %}
+                    {{ comparacion_periodos.variacion_porcentual | cop(1) }}%
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <h2>Gasto vs. venta por dia (ultimos 30 dias)</h2>
+    <canvas id="graficaGastoVenta" height="100"></canvas>
+
+    <h2>Proveedores principales (ultimos 30 dias)</h2>
+    {% if top_proveedores %}
+    <table>
+        <tr><th>Proveedor</th><th>Facturas</th><th>Total gastado</th></tr>
+        {% for p in top_proveedores %}
+        <tr><td>{{ p.proveedor }}</td><td>{{ p.cantidad_facturas }}</td><td>${{ p.total_gastado | cop }}</td></tr>
+        {% endfor %}
+    </table>
+    {% else %}
+    <p class="vacio">Todavia no hay suficientes datos.</p>
+    {% endif %}
+
+    <h2>Items mas frecuentes (ultimos 30 dias)</h2>
+    {% if item_mas_frecuente %}
+    <table>
+        <tr><th>Descripcion</th><th>Veces</th><th>Total gastado</th></tr>
+        {% for it in item_mas_frecuente %}
+        <tr><td>{{ it.descripcion }}</td><td>{{ it.veces }}</td><td>${{ it.total_gastado | cop }}</td></tr>
+        {% endfor %}
+    </table>
+    {% else %}
+    <p class="vacio">Todavia no hay suficientes datos.</p>
+    {% endif %}
+
+    {% if facturas_incompletas %}
+    <h2>Facturas para revisar</h2>
+    <div class="aviso">
+        {{ facturas_incompletas|length }} factura(s) de los ultimos 30 dias quedaron con el proveedor o el total sin detectar. Puede que valga la pena revisarlas o volver a subir la foto.
+    </div>
+    <table>
+        <tr><th>ID</th><th>Proveedor</th><th>Total</th><th>Procesada</th></tr>
+        {% for f in facturas_incompletas %}
+        <tr>
+            <td>{{ f.factura_id }}</td>
+            <td>{{ f.proveedor_nombre or '(sin detectar)' }}</td>
+            <td>{% if f.total is not none %}${{ f.total | cop }}{% else %}(sin detectar){% endif %}</td>
+            <td>{{ f.fecha_procesado }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+
+    <p><a href="/registrar-venta">Registrar la venta de hoy &rarr;</a></p>
+
+    <script>
+        // datosGrafica llega ya calculado desde Flask (una lista de 30
+        // fechas y sus totales de gasto/venta) via el filtro |tojson,
+        // que convierte el diccionario de Python en un objeto JS de forma
+        // segura para insertarlo dentro de un <script>.
+        const datosGrafica = {{ datos_grafica | tojson }};
+        const ctx = document.getElementById('graficaGastoVenta');
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: datosGrafica.dias,
+                datasets: [
+                    {
+                        label: 'Gasto',
+                        data: datosGrafica.gasto,
+                        borderColor: '#c0392b',
+                        backgroundColor: 'rgba(192, 57, 43, 0.1)',
+                        tension: 0.2
+                    },
+                    {
+                        label: 'Venta',
+                        data: datosGrafica.venta,
+                        borderColor: '#1a7a1a',
+                        backgroundColor: 'rgba(26, 122, 26, 0.1)',
+                        tension: 0.2
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                scales: { y: { beginAtZero: true } }
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+# Ruta del panel de gestion: arma la pagina completa que va a usar el
+# microempresario (antes se verifico esta misma logica con la ruta
+# temporal /panel-debug, ya retirada -- ver nota mas abajo).
+@app.route('/panel')
+def panel():
+    hoy = date.today()
+    inicio_30 = hoy - timedelta(days=29)
+
+    conexion = pg8000.native.Connection(
+        user=DB_USER, password=DB_PASSWORD,
+        host=DB_HOST, port=DB_PORT, database=DB_NAME
+    )
+    try:
+        gasto_por_dia = obtener_gasto_por_dia(conexion, inicio_30, hoy)
+        venta_por_dia = obtener_venta_por_dia(conexion, inicio_30, hoy)
+        resumen_gasto_hoy = obtener_resumen_gasto(conexion, hoy, hoy)
+        top_proveedores = obtener_top_proveedores(conexion, inicio_30, hoy)
+        item_mas_frecuente = obtener_item_mas_frecuente(conexion, inicio_30, hoy)
+        facturas_incompletas = obtener_facturas_incompletas(conexion, inicio_30, hoy)
+        comparacion_periodos = obtener_comparacion_periodos(conexion, hoy)
+        comparacion_gasto_venta = obtener_comparacion_gasto_venta(conexion, inicio_30, hoy)
+    finally:
+        conexion.close()
+
+    # Para graficar gasto y venta en el mismo eje de tiempo, ambas series
+    # necesitan un valor para cada uno de los 30 dias, aunque ese dia no
+    # haya tenido gasto o venta -- si no, Chart.js desalinearia los puntos
+    # de una serie respecto a la otra. Se arma un diccionario dia->total
+    # por cada serie, y se recorren los 30 dias rellenando con 0 los que
+    # no tengan dato.
+    mapa_gasto = {fila['dia']: fila['total'] for fila in gasto_por_dia}
+    mapa_venta = {fila['dia']: fila['total'] for fila in venta_por_dia}
+    dias = [str(inicio_30 + timedelta(days=i)) for i in range(30)]
+    datos_grafica = {
+        'dias': dias,
+        'gasto': [mapa_gasto.get(d, 0) for d in dias],
+        'venta': [mapa_venta.get(d, 0) for d in dias],
+    }
+
+    # La venta de hoy se muestra en su propia tarjeta; si todavia no se ha
+    # registrado, simplemente no va a estar en mapa_venta.
+    venta_hoy = mapa_venta.get(str(hoy))
+
+    return render_template_string(
+        PANEL_GESTION_HTML,
+        resumen_gasto_hoy=resumen_gasto_hoy,
+        venta_hoy=venta_hoy,
+        top_proveedores=top_proveedores,
+        item_mas_frecuente=item_mas_frecuente,
+        facturas_incompletas=facturas_incompletas,
+        comparacion_periodos=comparacion_periodos,
+        comparacion_gasto_venta=comparacion_gasto_venta,
+        datos_grafica=datos_grafica
+    )
+
+
+# NOTA: la ruta temporal /panel-debug (que devolvia todas las consultas en
+# JSON crudo) ya cumplio su proposito -- confirmar que los datos eran
+# correctos antes de construir la plantilla visual -- y se retiro aqui,
+# igual que se retiro el log temporal de la Lambda en la seccion 5.45 de
+# la bitacora de la v1. El panel real (/panel, arriba) ya la reemplaza.
+
+
+# Formulario minimo (sin estilos todavia) para registrar la venta total
+# de un dia. GET muestra el formulario; POST guarda el dato y vuelve a
+# mostrar el formulario con un mensaje de confirmacion o de error.
+FORM_VENTA_HTML = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Registrar venta del dia</title>
+</head>
+<body>
+    <p><a href="/">&larr; Volver</a></p>
+    <h1>Registrar venta del dia</h1>
+    {% if mensaje %}
+        <p><strong>{{ mensaje }}</strong></p>
+    {% endif %}
+    <form method="POST">
+        <label>Fecha: <input type="date" name="fecha" value="{{ fecha_hoy }}" required></label><br><br>
+        <label>Venta total del dia (COP): <input type="number" name="monto" step="0.01" min="0" required></label><br><br>
+        <button type="submit">Guardar</button>
+    </form>
+</body>
+</html>
+"""
+
+@app.route('/registrar-venta', methods=['GET', 'POST'])
+def registrar_venta():
+    mensaje = None
+    if request.method == 'POST':
+        fecha_texto = request.form.get('fecha')
+        monto_texto = request.form.get('monto')
+        try:
+            # date.fromisoformat espera exactamente 'AAAA-MM-DD', que es el
+            # formato que envia un <input type="date"> de HTML.
+            fecha_valor = date.fromisoformat(fecha_texto)
+            monto_valor = float(monto_texto)
+
+            conexion = pg8000.native.Connection(
+                user=DB_USER, password=DB_PASSWORD,
+                host=DB_HOST, port=DB_PORT, database=DB_NAME
+            )
+            try:
+                registrar_venta_diaria(conexion, fecha_valor, monto_valor)
+            finally:
+                conexion.close()
+
+            mensaje = f"Venta del {fecha_valor} registrada: ${monto_valor:,.2f}"
+        except (ValueError, TypeError):
+            # Se captura aqui cualquier fecha o monto mal escrito (por
+            # ejemplo, texto en vez de numero) para mostrar un mensaje
+            # claro en vez de que la aplicacion se caiga con un error 500.
+            mensaje = "Datos invalidos. Verifica la fecha y el monto."
+
+    return render_template_string(
+        FORM_VENTA_HTML,
+        mensaje=mensaje,
+        fecha_hoy=str(date.today())
+    )
+
+
+# =====================================================================
+# ASISTENTE CONVERSACIONAL (Amazon Bedrock, patron tool use)
+# =====================================================================
+
+# Cliente de Bedrock Runtime (el servicio que efectivamente invoca los
+# modelos -- "bedrock", sin "-runtime", es el servicio de administracion,
+# no el de inferencia). Se crea una sola vez a nivel de modulo, igual que
+# los otros clientes de boto3.
+bedrock_runtime = boto3.client('bedrock-runtime', region_name='us-east-1')
+
+# El "modelId" que espera la Converse API puede ser el ARN de un inference
+# profile (no el ID plano del modelo) cuando el modelo lo exige -- este es
+# justo ese caso, confirmado en la consola de Bedrock (Claude Haiku 4.5
+# aparece como "Cross-region inference").
+ID_MODELO_ASISTENTE = 'arn:aws:bedrock:us-east-1:<TU-CUENTA-AWS>:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0'  # Consola Bedrock > Cross-region inference > ARN del perfil
+
+# Definicion de las "herramientas" que el modelo puede pedir usar. Cada una
+# corresponde exactamente a una de las funciones de consulta ya definidas
+# arriba -- no se le da al modelo ninguna capacidad nueva, solo se le
+# describe lo que ya existe para que pueda elegir cual usar. Nada de esto
+# incluye registrar_venta_diaria a proposito (ver la nota de diseno: el
+# asistente es de solo lectura por ahora).
+CONFIGURACION_HERRAMIENTAS = {
+    'tools': [
+        {
+            'toolSpec': {
+                'name': 'obtener_gasto_por_dia',
+                'description': (
+                    'Devuelve el gasto total (segun las facturas de proveedores) '
+                    'de cada dia dentro de un rango de fechas. Util para ver la '
+                    'tendencia del gasto en el tiempo.'
+                ),
+                'inputSchema': {'json': {
+                    'type': 'object',
+                    'properties': {
+                        'fecha_inicio': {'type': 'string', 'description': 'Fecha de inicio del rango, formato AAAA-MM-DD'},
+                        'fecha_fin': {'type': 'string', 'description': 'Fecha de fin del rango (inclusive), formato AAAA-MM-DD'}
+                    },
+                    'required': ['fecha_inicio', 'fecha_fin']
+                }}
+            }
+        },
+        {
+            'toolSpec': {
+                'name': 'obtener_facturas_de_un_dia',
+                'description': 'Devuelve el detalle de las facturas (gastos) procesadas en un dia especifico.',
+                'inputSchema': {'json': {
+                    'type': 'object',
+                    'properties': {
+                        'fecha': {'type': 'string', 'description': 'La fecha exacta a consultar, formato AAAA-MM-DD'}
+                    },
+                    'required': ['fecha']
+                }}
+            }
+        },
+        {
+            'toolSpec': {
+                'name': 'obtener_resumen_gasto',
+                'description': (
+                    'Devuelve cuantas facturas y cuanto gasto total hubo dentro '
+                    'de un rango de fechas. Es la forma mas directa de responder '
+                    '"cuanto he gastado" en un periodo.'
+                ),
+                'inputSchema': {'json': {
+                    'type': 'object',
+                    'properties': {
+                        'fecha_inicio': {'type': 'string', 'description': 'Fecha de inicio del rango, formato AAAA-MM-DD'},
+                        'fecha_fin': {'type': 'string', 'description': 'Fecha de fin del rango (inclusive), formato AAAA-MM-DD'}
+                    },
+                    'required': ['fecha_inicio', 'fecha_fin']
+                }}
+            }
+        },
+        {
+            'toolSpec': {
+                'name': 'obtener_top_proveedores',
+                'description': 'Devuelve los proveedores a los que mas se les ha comprado (por monto) dentro de un rango de fechas.',
+                'inputSchema': {'json': {
+                    'type': 'object',
+                    'properties': {
+                        'fecha_inicio': {'type': 'string', 'description': 'Fecha de inicio del rango, formato AAAA-MM-DD'},
+                        'fecha_fin': {'type': 'string', 'description': 'Fecha de fin del rango (inclusive), formato AAAA-MM-DD'},
+                        'limite': {'type': 'integer', 'description': 'Cuantos proveedores devolver como maximo (por defecto 5)'}
+                    },
+                    'required': ['fecha_inicio', 'fecha_fin']
+                }}
+            }
+        },
+        {
+            'toolSpec': {
+                'name': 'obtener_item_mas_frecuente',
+                'description': 'Devuelve los productos o servicios comprados con mas frecuencia dentro de un rango de fechas.',
+                'inputSchema': {'json': {
+                    'type': 'object',
+                    'properties': {
+                        'fecha_inicio': {'type': 'string', 'description': 'Fecha de inicio del rango, formato AAAA-MM-DD'},
+                        'fecha_fin': {'type': 'string', 'description': 'Fecha de fin del rango (inclusive), formato AAAA-MM-DD'},
+                        'limite': {'type': 'integer', 'description': 'Cuantos items devolver como maximo (por defecto 5)'}
+                    },
+                    'required': ['fecha_inicio', 'fecha_fin']
+                }}
+            }
+        },
+        {
+            'toolSpec': {
+                'name': 'obtener_facturas_incompletas',
+                'description': (
+                    'Devuelve las facturas de un rango de fechas a las que les '
+                    'falto el proveedor o el total (fallas de deteccion). Util '
+                    'para preguntas sobre calidad de datos o "que facturas debo revisar".'
+                ),
+                'inputSchema': {'json': {
+                    'type': 'object',
+                    'properties': {
+                        'fecha_inicio': {'type': 'string', 'description': 'Fecha de inicio del rango, formato AAAA-MM-DD'},
+                        'fecha_fin': {'type': 'string', 'description': 'Fecha de fin del rango (inclusive), formato AAAA-MM-DD'}
+                    },
+                    'required': ['fecha_inicio', 'fecha_fin']
+                }}
+            }
+        },
+        {
+            'toolSpec': {
+                'name': 'obtener_venta_por_dia',
+                'description': (
+                    'Devuelve la venta total registrada a mano por el usuario, '
+                    'por cada dia dentro de un rango de fechas.'
+                ),
+                'inputSchema': {'json': {
+                    'type': 'object',
+                    'properties': {
+                        'fecha_inicio': {'type': 'string', 'description': 'Fecha de inicio del rango, formato AAAA-MM-DD'},
+                        'fecha_fin': {'type': 'string', 'description': 'Fecha de fin del rango (inclusive), formato AAAA-MM-DD'}
+                    },
+                    'required': ['fecha_inicio', 'fecha_fin']
+                }}
+            }
+        },
+        {
+            'toolSpec': {
+                'name': 'obtener_comparacion_gasto_venta',
+                'description': (
+                    'Compara el gasto total contra la venta total registrada en un '
+                    'rango de fechas, y calcula un margen aproximado (venta menos '
+                    'gasto). Util para preguntas sobre ganancia o perdida.'
+                ),
+                'inputSchema': {'json': {
+                    'type': 'object',
+                    'properties': {
+                        'fecha_inicio': {'type': 'string', 'description': 'Fecha de inicio del rango, formato AAAA-MM-DD'},
+                        'fecha_fin': {'type': 'string', 'description': 'Fecha de fin del rango (inclusive), formato AAAA-MM-DD'}
+                    },
+                    'required': ['fecha_inicio', 'fecha_fin']
+                }}
+            }
+        },
+        {
+            'toolSpec': {
+                'name': 'obtener_comparacion_gasto_ultimos_30_dias',
+                'description': (
+                    'Compara el gasto de los ultimos 30 dias contra los 30 dias '
+                    'anteriores a esos, y da el porcentaje de variacion. Util para '
+                    '"esta subiendo mi gasto?" sin que el usuario tenga que dar fechas.'
+                ),
+                'inputSchema': {'json': {'type': 'object', 'properties': {}}}
+            }
+        }
+    ]
+}
+
+
+# Cuantos mensajes anteriores de la conversacion (preguntas del usuario +
+# respuestas finales del asistente, sin contar los mensajes intermedios de
+# uso de herramientas) se le mandan a Bedrock como contexto de una pregunta
+# nueva. Cada mensaje de historial que se manda es texto de entrada
+# adicional para el modelo, y los tokens de entrada tienen costo (ver
+# bitacora, seccion 5.9) -- este limite evita que una conversacion muy
+# larga vaya encareciendo cada pregunta nueva sin limite. 10 mensajes
+# equivalen a las ultimas 5 preguntas con sus 5 respuestas.
+HISTORIAL_MAXIMO_MENSAJES = 10
+
+
+# Arma el mensaje de sistema que se le manda al modelo en cada pregunta.
+# Es una funcion (no una constante) porque la fecha de hoy cambia cada dia
+# -- si fuera una constante calculada una sola vez al arrancar la
+# aplicacion, quedaria "congelada" en el dia en que el servidor arranco.
+def construir_instruccion_sistema():
+    return (
+        "Eres un asistente que ayuda a un microempresario colombiano a entender "
+        "el gasto y la venta de su negocio, a partir de datos reales guardados "
+        "en su base de datos.\n"
+        f"La fecha de hoy es {date.today().isoformat()} (formato AAAA-MM-DD).\n"
+        "Reglas estrictas que debes seguir siempre:\n"
+        "1. Nunca inventes ni calcules tu mismo una cifra de gasto, venta, "
+        "margen o cualquier numero relacionado con el negocio. Para CUALQUIER "
+        "pregunta que involucre un numero de este tipo, SIEMPRE debes usar una "
+        "de las herramientas disponibles y basar tu respuesta unicamente en el "
+        "resultado real que te devuelva.\n"
+        "2. Si necesitas un rango de fechas y el usuario uso una expresion "
+        "relativa (\"esta semana\", \"el mes pasado\", \"hoy\"), calcula las "
+        "fechas exactas tu mismo usando la fecha de hoy de arriba, y usa esas "
+        "fechas al invocar la herramienta.\n"
+        "3. Si la pregunta no se puede responder con las herramientas "
+        "disponibles, dilo explicitamente en vez de inventar una respuesta.\n"
+        "4. Responde siempre en espanol, de forma breve y clara, como si le "
+        "hablaras al dueno de una tienda -- no uses jerga tecnica ni menciones "
+        "nombres de funciones o de la base de datos.\n"
+        "5. No puedes registrar ventas ni modificar ningun dato: si te piden "
+        "eso, indica que hay que hacerlo desde la pagina de registrar venta.\n"
+        "6. Es posible que abajo veas mensajes anteriores de esta misma "
+        "conversacion. Si la pregunta actual hace referencia a algo "
+        "mencionado antes (ej. \"y la semana pasada?\", \"compara eso con "
+        "el mes anterior\"), usa ese contexto para entender a que se "
+        "refiere, pero SIGUE aplicando la regla 1: cualquier cifra nueva "
+        "que menciones debe venir de una herramienta invocada en esta "
+        "respuesta, nunca copiada o recalculada a mano de un mensaje "
+        "anterior.\n"
+        "7. Si una herramienta te devuelve una lista de registros (por "
+        "ejemplo, facturas de un dia) y tu respuesta los agrupa o resume "
+        "(por ejemplo, por proveedor), verifica antes de responder que la "
+        "suma de las cantidades de cada grupo sea igual a la cantidad "
+        "total de registros que recibiste. Si no cuadra, vuelve a contar "
+        "con cuidado en vez de reportar numeros inconsistentes -- un "
+        "resumen agrupado mal contado es tan enganoso como una cifra "
+        "inventada.\n"
+        "8. Si la pregunta es sobre facturas con datos incompletos o sin "
+        "detectar (proveedor o total faltante), usa la herramienta "
+        "obtener_facturas_incompletas en vez de inferirlo tu mismo "
+        "revisando una lista de facturas de otra herramienta -- esa "
+        "herramienta ya cuenta ese caso exactamente con SQL, y contarlo "
+        "tu mismo en la respuesta repite el mismo riesgo de la regla 7.\n"
+        "9. Si la pregunta pide el detalle o la lista de facturas de un dia "
+        "o periodo (por ejemplo \"que facturas se procesaron el...\"), y NO "
+        "pide explicitamente un resumen, total o agrupacion, presenta esa "
+        "lista tal cual -- proveedor, total y fecha de cada factura -- sin "
+        "agruparla por proveedor ni calcular subtotales por tu cuenta. "
+        "Armar una tabla agrupada que nadie pidio es la forma mas facil de "
+        "cometer el error de la regla 7 sin darte cuenta.\n"
+        "10. Si la pregunta si pide un total, un desglose por proveedor o "
+        "item, o cualquier otro tipo de agregacion, NUNCA sumes o cuentes "
+        "tu mismo los montos de una lista cruda de facturas -- usa la "
+        "herramienta que ya calcula ese agregado con SQL (por ejemplo "
+        "obtener_top_proveedores para desgloses por proveedor, o "
+        "obtener_item_mas_frecuente para el item mas comprado). Sumar en "
+        "prosa una lista cruda es como copiar a mano un calculo que una "
+        "herramienta ya hizo bien -- el riesgo de asignarle un valor "
+        "equivocado a una factura sin total detectado (violando la regla 1 "
+        "de forma indirecta) es alto y ya paso antes.\n"
+        "11. Esta conversacion se muestra en el navegador como texto plano, "
+        "NO como markdown -- si usas tablas con \"|\", separadores \"---\", "
+        "negritas con \"**\" o encabezados con \"#\", el usuario vera esos "
+        "simbolos literalmente en la pantalla, no un formato bonito. Por "
+        "eso nunca uses sintaxis de markdown. Para listas (por ejemplo de "
+        "facturas), escribe un elemento por linea con saltos de linea "
+        "simples, usando un guion o un numero al inicio de cada linea (ej. "
+        "\"- Factura de Rojo Polo Paella Inc.: $199.650\"). Si quieres "
+        "resaltar algo, usa palabras normales o mayusculas, nunca "
+        "asteriscos ni otros simbolos de formato.\n"
+        "12. Cualquier cifra en pesos colombianos que escribas debe usar "
+        "el formato colombiano: el punto se usa como separador de miles, "
+        "y NUNCA agregues decimales ni centavos (el peso colombiano no se "
+        "usa en centavos en la practica). Por ejemplo, escribe $32.761 y "
+        "$17.620, nunca $32.761.00 ni $32,761.00 ni $32761. Aplica esto en "
+        "cada cifra de cada respuesta, sin excepcion, incluyendo listas y "
+        "totales."
+    )
+
+
+# Convierte un texto 'AAAA-MM-DD' (lo que el modelo va a mandar como
+# parametro) a un objeto date de Python. Se separa en su propia funcion
+# para poder dar un mensaje de error claro si el modelo manda una fecha
+# mal formada, en vez de que truene con un error críptico de Python.
+def _interpretar_fecha(texto):
+    try:
+        return date.fromisoformat(texto)
+    except (TypeError, ValueError):
+        raise ValueError(f"Fecha invalida: '{texto}'. Debe tener el formato AAAA-MM-DD.")
+
+
+# Punto unico de despacho: recibe el nombre de la herramienta que pidio el
+# modelo y sus argumentos (ya parseados de JSON), y llama a la funcion de
+# consulta real correspondiente. Cualquier herramienta no reconocida, o
+# cualquier argumento invalido, levanta una excepcion -- el llamador
+# (procesar_pregunta) la convierte en un "tool result" de error para que
+# el modelo pueda reaccionar, en vez de que la peticion HTTP completa falle.
+def ejecutar_herramienta(conexion, nombre, argumentos):
+    if nombre == 'obtener_gasto_por_dia':
+        return obtener_gasto_por_dia(
+            conexion,
+            _interpretar_fecha(argumentos['fecha_inicio']),
+            _interpretar_fecha(argumentos['fecha_fin'])
+        )
+    elif nombre == 'obtener_facturas_de_un_dia':
+        return obtener_facturas_de_un_dia(conexion, _interpretar_fecha(argumentos['fecha']))
+    elif nombre == 'obtener_resumen_gasto':
+        return obtener_resumen_gasto(
+            conexion,
+            _interpretar_fecha(argumentos['fecha_inicio']),
+            _interpretar_fecha(argumentos['fecha_fin'])
+        )
+    elif nombre == 'obtener_top_proveedores':
+        return obtener_top_proveedores(
+            conexion,
+            _interpretar_fecha(argumentos['fecha_inicio']),
+            _interpretar_fecha(argumentos['fecha_fin']),
+            argumentos.get('limite', 5)
+        )
+    elif nombre == 'obtener_item_mas_frecuente':
+        return obtener_item_mas_frecuente(
+            conexion,
+            _interpretar_fecha(argumentos['fecha_inicio']),
+            _interpretar_fecha(argumentos['fecha_fin']),
+            argumentos.get('limite', 5)
+        )
+    elif nombre == 'obtener_facturas_incompletas':
+        return obtener_facturas_incompletas(
+            conexion,
+            _interpretar_fecha(argumentos['fecha_inicio']),
+            _interpretar_fecha(argumentos['fecha_fin'])
+        )
+    elif nombre == 'obtener_venta_por_dia':
+        return obtener_venta_por_dia(
+            conexion,
+            _interpretar_fecha(argumentos['fecha_inicio']),
+            _interpretar_fecha(argumentos['fecha_fin'])
+        )
+    elif nombre == 'obtener_comparacion_gasto_venta':
+        return obtener_comparacion_gasto_venta(
+            conexion,
+            _interpretar_fecha(argumentos['fecha_inicio']),
+            _interpretar_fecha(argumentos['fecha_fin'])
+        )
+    elif nombre == 'obtener_comparacion_gasto_ultimos_30_dias':
+        return obtener_comparacion_periodos(conexion, date.today())
+    else:
+        raise ValueError(f"Herramienta desconocida: '{nombre}'")
+
+
+# Logica central del asistente: recibe el historial de la conversacion
+# (una lista de turnos anteriores, ya validada por la ruta /chat) y la
+# pregunta nueva del usuario, y devuelve la respuesta final en texto
+# plano, manejando por dentro todas las rondas de ida y vuelta con
+# Bedrock que hagan falta (pregunta -> el modelo pide una herramienta ->
+# se ejecuta -> se le devuelve el resultado -> el modelo responde, o pide
+# otra herramienta...).
+#
+# NOTA DE DISENO IMPORTANTE: el historial no se guarda en el servidor (ni
+# en memoria ni en la base de datos). Viaja completo en cada peticion HTTP
+# desde el navegador, y esta funcion solo lo usa para armar los mensajes
+# de esta llamada -- el servidor no recuerda nada entre una peticion y la
+# siguiente. Esto es deliberado: hay dos instancias EC2 detras de un ALB
+# que reparte peticiones por turnos (ver bitacora, secciones 5.7 y 5.13),
+# y si el historial viviera en la memoria de una sola instancia, la
+# siguiente pregunta del mismo usuario podria caer en la otra instancia y
+# "olvidar" la conversacion. Guardarlo en el navegador evita ese problema
+# por completo, sin necesidad de sesiones pegajosas (sticky sessions) ni
+# de una tabla nueva en la base de datos.
+def procesar_pregunta(historial, pregunta_usuario):
+    # Cada turno del historial (ver formato validado en la ruta /chat) es
+    # un diccionario simple {'role': 'user'|'assistant', 'texto': '...'}
+    # -- se convierte aqui al formato que espera la Converse API de
+    # Bedrock ({'role': ..., 'content': [{'text': ...}]}). Solo se toman
+    # los ultimos HISTORIAL_MAXIMO_MENSAJES, para no encarecer cada
+    # pregunta nueva con una conversacion indefinidamente larga.
+    mensajes = [
+        {'role': turno['role'], 'content': [{'text': turno['texto']}]}
+        for turno in historial[-HISTORIAL_MAXIMO_MENSAJES:]
+    ]
+    mensajes.append({'role': 'user', 'content': [{'text': pregunta_usuario}]})
+
+    conexion = pg8000.native.Connection(
+        user=DB_USER, password=DB_PASSWORD,
+        host=DB_HOST, port=DB_PORT, database=DB_NAME
+    )
+    try:
+        # Limite de rondas: es una proteccion barata contra un ciclo que no
+        # termine (el modelo pidiendo herramientas indefinidamente). Cinco
+        # rondas son de sobra para cualquier pregunta razonable de este
+        # panel -- la mayoria se resuelve en una sola.
+        for _ in range(5):
+            try:
+                respuesta = bedrock_runtime.converse(
+                    modelId=ID_MODELO_ASISTENTE,
+                    system=[{'text': construir_instruccion_sistema()}],
+                    messages=mensajes,
+                    toolConfig=CONFIGURACION_HERRAMIENTAS,
+                    inferenceConfig={'maxTokens': 500, 'temperature': 0}
+                )
+            except ClientError as error:
+                # Errores de permisos, del ID del modelo, limites de la
+                # cuenta, etc. -- se le muestra al usuario un mensaje
+                # entendible en vez de un error 500 crudo. Solo se expone el
+                # codigo del error (ej. "ValidationException"), no el
+                # mensaje completo de AWS, para no mostrarle al usuario
+                # final detalles tecnicos internos de la infraestructura.
+                return f"No pude conectarme con el asistente en este momento ({error.response['Error']['Code']})."
+
+            razon_de_parada = respuesta['stopReason']
+            mensaje_modelo = respuesta['output']['message']
+            mensajes.append(mensaje_modelo)
+
+            if razon_de_parada != 'tool_use':
+                # El modelo ya dio su respuesta final en texto -- se junta
+                # todo el texto de la respuesta (normalmente es un solo
+                # bloque, pero se recorren todos por seguridad).
+                return ''.join(
+                    bloque['text'] for bloque in mensaje_modelo['content'] if 'text' in bloque
+                )
+
+            # El modelo pidio usar una o mas herramientas en este turno.
+            resultados_de_herramientas = []
+            for bloque in mensaje_modelo['content']:
+                if 'toolUse' not in bloque:
+                    continue
+                solicitud = bloque['toolUse']
+                try:
+                    resultado = ejecutar_herramienta(conexion, solicitud['name'], solicitud.get('input') or {})
+                    # IMPORTANTE: el campo "json" de un toolResult en la Converse
+                    # API de Bedrock debe ser un objeto (diccionario), no un
+                    # arreglo -- si resultado es una lista (como devuelven varias
+                    # de las funciones de consulta, ej. obtener_top_proveedores),
+                    # Bedrock rechaza la peticion completa con ValidationException
+                    # antes de que el modelo la vea. Por eso se envuelve siempre
+                    # en un diccionario con la clave "resultado", sin importar si
+                    # el valor original era una lista, un diccionario, o incluso
+                    # None -- asi el nivel superior siempre es un objeto valido.
+                    resultados_de_herramientas.append({
+                        'toolResult': {
+                            'toolUseId': solicitud['toolUseId'],
+                            'content': [{'json': {'resultado': resultado}}]
+                        }
+                    })
+                except Exception as error:
+                    # Si la herramienta falla (fecha invalida, herramienta
+                    # desconocida, etc.), se le informa el error al modelo
+                    # -- puede intentar corregir el parametro, o explicarle
+                    # al usuario que no pudo resolver la pregunta.
+                    resultados_de_herramientas.append({
+                        'toolResult': {
+                            'toolUseId': solicitud['toolUseId'],
+                            'content': [{'text': str(error)}],
+                            'status': 'error'
+                        }
+                    })
+
+            mensajes.append({'role': 'user', 'content': resultados_de_herramientas})
+
+        # Se agotaron las rondas sin una respuesta final -- se corta aqui
+        # para no dejar la peticion HTTP esperando indefinidamente.
+        return "No pude terminar de procesar tu pregunta. Intenta reformularla de forma mas simple."
+    finally:
+        conexion.close()
+
+
+# Ruta que recibe la pregunta del widget de chat (ver ASISTENTE_HTML), junto
+# con el historial de la conversacion que el propio navegador viene
+# acumulando, y devuelve la respuesta del asistente en JSON.
+@app.route('/chat', methods=['POST'])
+def chat():
+    datos = request.get_json(silent=True) or {}
+    pregunta = (datos.get('pregunta') or '').strip()
+    if not pregunta:
+        return jsonify({'respuesta': 'Escribe una pregunta primero.'}), 400
+
+    # El historial viene del navegador (ver nota de diseno en
+    # procesar_pregunta): nunca se debe confiar en que tenga exactamente
+    # la forma esperada, asi que se filtra aqui cualquier turno mal
+    # formado en vez de pasarselo tal cual a Bedrock -- un solo campo
+    # invalido en el JSON del historial no debe tumbar la peticion con un
+    # error 500.
+    historial_bruto = datos.get('historial') or []
+    historial_valido = [
+        turno for turno in historial_bruto
+        if isinstance(turno, dict)
+        and turno.get('role') in ('user', 'assistant')
+        and isinstance(turno.get('texto'), str)
+    ]
+
+    return jsonify({'respuesta': procesar_pregunta(historial_valido, pregunta)})
+
+
+# Pagina del widget de chat. El historial de la conversacion se guarda
+# solo en el navegador (en la variable JS "historial", no en el DOM) y se
+# manda completo en cada peticion a /chat -- el backend es quien decide
+# cuantos mensajes de ese historial realmente usa (ver
+# HISTORIAL_MAXIMO_MENSAJES en el backend). Ver la nota de diseno junto a
+# procesar_pregunta() sobre por que el historial no se guarda en el
+# servidor.
+ASISTENTE_HTML = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Asistente de negocio</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 24px auto; padding: 0 16px; }
+        h1 { font-size: 20px; }
+        .volver { display: inline-block; margin-bottom: 16px; color: #0066cc; }
+        .cabecera { display: flex; justify-content: space-between; align-items: center; }
+        .nueva-conversacion { background: none; border: 1px solid #ccc; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
+        #conversacion { min-height: 200px; }
+        #conversacion p { margin: 8px 0; padding: 8px 12px; border-radius: 8px; white-space: pre-wrap; }
+        #conversacion p.usuario { background: #e8f0fe; text-align: right; }
+        #conversacion p.asistente { background: #f0f0f0; }
+        .fila-entrada { display: flex; gap: 8px; margin-top: 16px; }
+        #entrada { flex: 1; padding: 10px; font-size: 15px; }
+        button { padding: 10px 16px; background: #FF9900; border: none; border-radius: 6px; font-size: 15px; }
+    </style>
+</head>
+<body>
+    <a class="volver" href="/panel">&larr; Volver al panel</a>
+    <div class="cabecera">
+        <h1>Preguntale a tu negocio</h1>
+        <button class="nueva-conversacion" onclick="nuevaConversacion()">Nueva conversacion</button>
+    </div>
+    <div id="conversacion"></div>
+    <div class="fila-entrada">
+        <input id="entrada" type="text" placeholder="Ej: cuanto he gastado esta semana?">
+        <button onclick="enviarPregunta()">Enviar</button>
+    </div>
+
+    <script>
+        // El historial vive solo en esta pestana del navegador (se pierde
+        // al recargar la pagina o cerrarla -- es una limitacion conocida
+        // y aceptada de esta primera version, no un descuido). Cada
+        // elemento es {role: 'user'|'assistant', texto: '...'}, el mismo
+        // formato simple que valida la ruta /chat en el backend.
+        let historial = [];
+
+        // Enter tambien envia la pregunta, no solo el boton.
+        document.getElementById('entrada').addEventListener('keydown', function (evento) {
+            if (evento.key === 'Enter') enviarPregunta();
+        });
+
+        async function enviarPregunta() {
+            const entrada = document.getElementById('entrada');
+            const pregunta = entrada.value.trim();
+            if (!pregunta) return;
+
+            agregarMensaje('usuario', pregunta);
+            entrada.value = '';
+
+            const indicador = agregarMensaje('asistente', 'Pensando...');
+
+            try {
+                const respuestaHttp = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pregunta: pregunta, historial: historial })
+                });
+                const datos = await respuestaHttp.json();
+                indicador.textContent = datos.respuesta;
+
+                // Solo se agrega al historial DESPUES de una respuesta
+                // exitosa -- si la peticion falla (catch de abajo), la
+                // pregunta no queda "a medias" en el historial que se
+                // manda la proxima vez.
+                historial.push({ role: 'user', texto: pregunta });
+                historial.push({ role: 'assistant', texto: datos.respuesta });
+            } catch (error) {
+                indicador.textContent = 'Hubo un error de conexion. Intenta de nuevo.';
+            }
+        }
+
+        // Borra el historial en memoria y la conversacion visible, para
+        // empezar de cero -- util tanto si el usuario quiere cambiar de
+        // tema como para controlar el costo (una conversacion mas corta
+        // manda menos texto de contexto en cada pregunta nueva).
+        function nuevaConversacion() {
+            historial = [];
+            document.getElementById('conversacion').innerHTML = '';
+        }
+
+        function agregarMensaje(quien, texto) {
+            const conversacion = document.getElementById('conversacion');
+            const parrafo = document.createElement('p');
+            parrafo.className = quien;
+            parrafo.textContent = texto;
+            conversacion.appendChild(parrafo);
+            return parrafo;
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/asistente')
+def asistente():
+    return render_template_string(ASISTENTE_HTML)
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)

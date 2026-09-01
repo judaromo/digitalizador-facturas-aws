@@ -10,13 +10,8 @@ textract = boto3.client('textract')
 # para que se reutilice entre invocaciones "calientes" de la Lambda.
 ssm = boto3.client('ssm', region_name='us-east-1')
 
-# --- Valores especificos de esta instalacion -------------------------------
-# Reemplaza este valor con el endpoint real de tu instancia RDS antes de
-# desplegar. No es un secreto por si solo (RDS esta en una subred privada
-# sin acceso publico), pero es un identificador propio de una cuenta real y
-# no se deja como valor fijo en un repositorio publico.
+# Datos de conexion a RDS
 DB_HOST = '<TU-ENDPOINT-RDS>.rds.amazonaws.com'  # Consola RDS > Bases de datos > Punto de enlace (endpoint)
-# -----------------------------------------------------------------------
 
 DB_PORT = 5432
 DB_NAME = 'facturas'
@@ -92,11 +87,37 @@ def extraer_items(response):
     return items
 
 # Extrae el primer numero valido dentro de un texto como '$10.00',
-# '500 units' o '199.65 €', ignorando simbolos de moneda, espacios o
-# palabras alrededor. Si no encuentra ningun numero, devuelve None en vez
-# de fallar. (Corregido: la version original solo quitaba el simbolo de
-# euro y no reconocia palabras pegadas al numero -- ver seccion 5.42 de la
-# documentacion del proyecto.)
+# '500 units', '199.65 €' o '100.000,00', ignorando simbolos de moneda,
+# espacios o palabras alrededor. Si no encuentra ningun numero, devuelve
+# None en vez de fallar. (Corregido antes: la version original solo
+# quitaba el simbolo de euro y no reconocia palabras pegadas al numero --
+# ver seccion 5.42 de la documentacion del proyecto.)
+#
+# Corregido de nuevo (seccion 5.23): la version anterior de esta funcion
+# asumia siempre la convencion estadounidense (coma = separador de miles,
+# punto = decimal) -- por ejemplo "$5,000.00" -> 5000.0. Eso interpreta
+# MAL cualquier cifra en convencion colombiana (punto = miles, coma =
+# decimal), que es como las facturas electronicas colombianas reales
+# imprimen sus numeros. El caso que expuso el bug: una factura electronica
+# real traia "Cantidad: 1,00" (es decir, uno) y la funcion anterior lo
+# convertia en 100.0 (le quitaba la coma sin mas, como si fuera un
+# separador de miles).
+#
+# La regla para decidir cual convencion aplica en cada caso:
+#   - Si el texto tiene punto Y coma, el separador decimal es el que
+#     aparece MAS A LA DERECHA (mas cerca del final) -- el otro simbolo,
+#     sea cual sea, es separador de miles. Ej: "100.000,00" (la coma va
+#     de ultima) es colombiano -> 100000.0. "5,000.00" (el punto va de
+#     ultimo) es estadounidense -> 5000.0.
+#   - Si el texto solo tiene uno de los dos simbolos, se decide por la
+#     cantidad de digitos despues de ese simbolo: exactamente 2 digitos
+#     casi siempre es un decimal (centavos, en cualquiera de las dos
+#     convenciones); exactamente 3 digitos casi siempre es una
+#     agrupacion de miles sin decimales. Ej: "1,00" (2 digitos tras la
+#     coma) -> 1.0. "5,000" (3 digitos tras la coma) -> 5000.0. "5.000"
+#     (3 digitos tras el punto) -> 5000.0. "199.65" (2 digitos tras el
+#     punto, el caso mas comun en las facturas de prueba en ingles ya
+#     usadas en este proyecto) -> 199.65, sin cambios de comportamiento.
 def limpiar_numero(texto):
     if not texto:
         return None
@@ -104,8 +125,40 @@ def limpiar_numero(texto):
     if not coincidencia:
         return None
     numero_bruto = coincidencia.group()
-    # Quita las comas (separador de miles en formato US/es-CO: "$5,000.00")
-    limpio = numero_bruto.replace(',', '')
+
+    tiene_punto = '.' in numero_bruto
+    tiene_coma = ',' in numero_bruto
+
+    if tiene_punto and tiene_coma:
+        if numero_bruto.rfind(',') > numero_bruto.rfind('.'):
+            # La coma va de ultima: convencion colombiana.
+            # "100.000,00" -> quita los puntos (miles), la coma pasa a
+            # ser el punto decimal -> "100000.00"
+            limpio = numero_bruto.replace('.', '').replace(',', '.')
+        else:
+            # El punto va de ultimo: convencion estadounidense.
+            # "5,000.00" -> quita las comas (miles) -> "5000.00"
+            limpio = numero_bruto.replace(',', '')
+    elif tiene_coma:
+        digitos_despues = len(numero_bruto.split(',')[-1])
+        if digitos_despues == 2:
+            # "1,00" -> "1.00" (decimal colombiano)
+            limpio = numero_bruto.replace(',', '.')
+        else:
+            # "5,000" -> "5000" (miles estadounidense, sin decimales)
+            limpio = numero_bruto.replace(',', '')
+    elif tiene_punto:
+        digitos_despues = len(numero_bruto.split('.')[-1])
+        if digitos_despues == 3:
+            # "5.000" -> "5000" (miles colombiano, sin decimales)
+            limpio = numero_bruto.replace('.', '')
+        else:
+            # "199.65" -> sin cambios (decimal estadounidense, el caso
+            # ya usado por todas las facturas de prueba de este proyecto)
+            limpio = numero_bruto
+    else:
+        limpio = numero_bruto
+
     try:
         return float(limpio)
     except ValueError:
@@ -186,32 +239,142 @@ def guardar_en_rds(campos, items, s3_key):
     )
 
     try:
+        # 'TAX' es el tipo de campo estandar que Textract usa para el valor
+        # del impuesto en una factura, igual que 'TOTAL' o 'VENDOR_NAME' --
+        # ver seccion 5.28 de la documentacion del proyecto. Cuando la
+        # factura no tiene impuesto detectado (o no aplica, como en el caso
+        # de un vendedor no responsable de IVA), campos.get('TAX') devuelve
+        # None y limpiar_numero lo deja en None tambien -- se guarda como
+        # NULL en la base de datos, nunca como 0 (0 significaria "el
+        # impuesto es cero", que es una afirmacion distinta a "no se sabe").
         resultado = conexion.run(
             """
-            INSERT INTO factura (proveedor_nombre, fecha_factura, total, s3_key, datos_textract_raw)
-            VALUES (:proveedor, :fecha, :total, :s3_key, :raw)
+            INSERT INTO factura (proveedor_nombre, fecha_factura, total, impuesto, s3_key, datos_textract_raw)
+            VALUES (:proveedor, :fecha, :total, :impuesto, :s3_key, :raw)
             RETURNING factura_id
             """,
             proveedor=campos.get('VENDOR_NAME'),
             fecha=parsear_fecha(campos.get('INVOICE_RECEIPT_DATE')),
             total=limpiar_numero(campos.get('TOTAL')),
+            impuesto=limpiar_numero(campos.get('TAX')),
             s3_key=s3_key,
             raw=json.dumps(campos)
         )
         factura_id = resultado[0][0]
 
+        # Se acumulan aqui los subtotales de cada item (cuando Textract lo
+        # detecto) para la validacion de factura completa que se hace
+        # despues del for, una vez insertados todos los items.
+        subtotales_detectados = []
+
         for item in items:
+            descripcion = item.get('ITEM')
+            cantidad = limpiar_numero(item.get('QUANTITY'))
+            precio = limpiar_numero(item.get('UNIT_PRICE'))
+            subtotal = limpiar_numero(item.get('PRICE'))
+            subtotales_detectados.append(subtotal)
+
+            # Validacion (no bloqueante, no correctiva): si Textract detecto
+            # los tres valores, cantidad x precio deberia dar aprox. el
+            # subtotal. Si no cuadra, NO se corrige ni se recalcula nada --
+            # eso equivaldria a inventar un valor que Textract no reporto,
+            # el mismo riesgo que ya se evito deliberadamente en el
+            # asistente conversacional (reglas 9 y 10). Solo se deja un
+            # aviso en los logs de CloudWatch para poder revisarlo despues.
+            # La tolerancia (0.5) da margen a redondeos de centavos que
+            # Textract a veces introduce al leer el subtotal impreso.
+            if cantidad is not None and precio is not None and subtotal is not None:
+                calculado = round(cantidad * precio, 2)
+                if abs(calculado - subtotal) > 0.5:
+                    print(
+                        f"AVISO factura_id={factura_id}: el item "
+                        f"'{descripcion}' no cuadra -- cantidad ({cantidad}) "
+                        f"x precio ({precio}) = {calculado}, pero el "
+                        f"subtotal detectado por Textract es {subtotal}"
+                    )
+
             conexion.run(
                 """
                 INSERT INTO item_factura (factura_id, descripcion, cantidad, precio_unitario, subtotal)
                 VALUES (:factura_id, :descripcion, :cantidad, :precio, :subtotal)
                 """,
                 factura_id=factura_id,
-                descripcion=item.get('ITEM'),
-                cantidad=limpiar_numero(item.get('QUANTITY')),
-                precio=limpiar_numero(item.get('UNIT_PRICE')),
-                subtotal=limpiar_numero(item.get('PRICE'))
+                descripcion=descripcion,
+                cantidad=cantidad,
+                precio=precio,
+                subtotal=subtotal
             )
+
+        # Validacion adicional a nivel de factura completa (no bloqueante,
+        # no correctiva -- mismo criterio que la validacion por item de
+        # arriba): la suma de los subtotales de todos los items deberia
+        # aproximarse al total de la factura.
+        #
+        # OJO con un supuesto que esta validacion SI hace y que puede no
+        # cumplirse: asume que 'total' es el valor final facturado, y que
+        # ese total puede o no incluir el impuesto por encima de la suma de
+        # subtotales -- eso varia segun como cada proveedor imprime su
+        # factura. Por eso no se compara contra un solo candidato: se
+        # compara contra la suma de subtotales sola, y (si hay impuesto
+        # detectado) tambien contra esa suma mas el impuesto. Solo se avisa
+        # si NINGUNA de las dos cuadra -- si se comparara contra un solo
+        # candidato fijo, facturas correctas con IVA (o sin el) generarian
+        # avisos falsos sistematicamente, no seria un caso raro. La
+        # tolerancia (0.5) es la misma que la validacion por item; al sumar
+        # varios items el redondeo acumulado podria en teoria superarla en
+        # facturas con muchas lineas, algo a tener en cuenta si este aviso
+        # empieza a salir seguido en facturas que sí cuadran a simple vista.
+        total_factura = limpiar_numero(campos.get('TOTAL'))
+        if total_factura is not None:
+            if subtotales_detectados and all(s is not None for s in subtotales_detectados):
+                suma_subtotales = round(sum(subtotales_detectados), 2)
+                impuesto_factura = limpiar_numero(campos.get('TAX'))
+                candidatos = [suma_subtotales]
+                if impuesto_factura is not None:
+                    candidatos.append(round(suma_subtotales + impuesto_factura, 2))
+
+                if not any(abs(c - total_factura) <= 0.5 for c in candidatos):
+                    detalle_impuesto = (
+                        f", ni sumandole el impuesto detectado ({impuesto_factura}) "
+                        f"para dar {candidatos[-1]}"
+                        if impuesto_factura is not None else
+                        " (no se detecto impuesto para probar esa alternativa)"
+                    )
+                    print(
+                        f"AVISO factura_id={factura_id}: la suma de los "
+                        f"subtotales de los items ({suma_subtotales}) no "
+                        f"cuadra con el total de la factura ({total_factura})"
+                        f"{detalle_impuesto}"
+                    )
+                elif (
+                    impuesto_factura is not None
+                    and abs(suma_subtotales - total_factura) <= 0.5
+                    and abs(candidatos[-1] - total_factura) > 0.5
+                ):
+                    # Caso distinto del AVISO de arriba: aqui SI cuadra, pero
+                    # cuadra con la suma de subtotales SOLA -- es decir, el
+                    # total de esta factura en particular parece no incluirle
+                    # el impuesto por encima (la excepcion que se menciono
+                    # que existe, frente a la regla general de que el total
+                    # deberia incluirlo). No es un error de la factura ni de
+                    # la extraccion, por eso va como INFO y no como AVISO --
+                    # pero se deja registrado para tener evidencia real de
+                    # que tan seguido pasa esto, en vez de quedarse solo con
+                    # la impresion de "en promedio, el total deberia incluir
+                    # el impuesto".
+                    print(
+                        f"INFO factura_id={factura_id}: el total de esta "
+                        f"factura ({total_factura}) parece NO incluir el "
+                        f"impuesto detectado ({impuesto_factura}) -- cuadra "
+                        f"con la suma de subtotales sola ({suma_subtotales}), "
+                        f"no con suma+impuesto ({candidatos[-1]})"
+                    )
+            else:
+                print(
+                    f"AVISO factura_id={factura_id}: no se pudo validar suma "
+                    f"de subtotales contra el total -- uno o mas items no "
+                    f"tienen subtotal detectado por Textract"
+                )
 
         print(f"Factura guardada en RDS con factura_id: {factura_id}")
         return factura_id
@@ -239,6 +402,7 @@ def lambda_handler(event, context):
     print(f"Proveedor: {campos.get('VENDOR_NAME', 'No detectado')}")
     print(f"Fecha detectada: {campos.get('INVOICE_RECEIPT_DATE', 'No detectada')} -> {parsear_fecha(campos.get('INVOICE_RECEIPT_DATE'))}")
     print(f"Total: {campos.get('TOTAL', 'No detectado')}")
+    print(f"Impuesto: {campos.get('TAX', 'No detectado')}")
     print(f"Items detectados: {len(items)}")
     print("==================================")
 
