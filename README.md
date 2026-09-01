@@ -37,6 +37,9 @@ Bedrock) para consultar los datos en lenguaje natural.
    lenguaje natural sobre el gasto, la venta y las facturas — siempre
    ejecutando una de un conjunto fijo de consultas SQL predefinidas contra
    RDS, nunca inventando una cifra por sí mismo.
+9. El mismo asistente también responde por WhatsApp (`/whatsapp-webhook`),
+   como prueba de concepto sobre el Sandbox de Twilio, con su propio
+   historial de conversación por número de teléfono guardado en RDS.
 
 ## Arquitectura
 
@@ -91,6 +94,12 @@ Antes de desplegar, necesitas:
    RDS (PostgreSQL) con las tablas `factura`, `item_factura` y
    `venta_diaria`, y un parámetro SecureString en SSM Parameter Store con
    la contraseña de RDS (`/facturas-app/rds-password`).
+   Opcional, solo si vas a habilitar el canal de WhatsApp: la tabla
+   `whatsapp_historial` (ver `docs/BITACORA_V2.md`, sección 5.31) y un
+   segundo parámetro SecureString con el Auth Token de una cuenta de
+   Twilio (`/facturas-app/twilio-auth-token`) — en ambos casos, el rol de
+   la instancia necesita permiso `ssm:GetParameter` sobre el parámetro
+   nuevo, no solo sobre el de la contraseña de RDS.
 2. En `app/app.py` y en `lambda/lambda_procesar_factura.py`, reemplazar
    `BUCKET_NAME`, `DB_HOST` y (solo en `app/app.py`) `ID_MODELO_ASISTENTE`
    con los valores reales de tu cuenta (están marcados en el código con
@@ -119,5 +128,5 @@ resuelta.
 
 AWS: VPC, EC2, Auto Scaling Group, Application Load Balancer, S3, Lambda,
 Textract, Bedrock, RDS (PostgreSQL), SSM Parameter Store, IAM.
-Backend: Python, Flask, boto3, pg8000.
+Backend: Python, Flask, boto3, pg8000, Twilio (canal de WhatsApp).
 Frontend: Chart.js (panel visual).
