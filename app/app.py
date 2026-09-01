@@ -33,6 +33,48 @@ def formatear_numero(valor, decimales=2):
 # poder usarlo directamente en las plantillas HTML como {{ valor | cop }}.
 app.jinja_env.filters['cop'] = formatear_numero
 
+# Reconciliacion de factura completa: MISMA logica que la validacion que
+# ya existe en la Lambda (lambda_procesar_factura.py, guardar_en_rds,
+# seccion 5.29 de la bitacora) -- pero calculada aqui, en el momento de
+# mostrar el panel, en vez de una sola vez cuando se procesa la factura.
+# Se eligio asi a proposito, no por descuido: calculandolo aqui, a partir
+# de lo que ya esta guardado en item_factura/factura, el chequeo aplica
+# de una vez a las 46 facturas ya procesadas (incluida Dotaciones Gamero)
+# sin necesidad de reprocesarlas ni de una migracion de datos -- el mismo
+# resultado que daria repetir el calculo de la Lambda, sin sus costos.
+#
+# Devuelve un diccionario con 'estado' en uno de cuatro valores:
+#   'ok'          -- el total cuadra (con o sin impuesto sumado encima)
+#   'sin_impuesto'-- cuadra SOLO sin sumarle el impuesto (ver seccion 5.29:
+#                    puede ser normal segun como el proveedor imprima el
+#                    total, no necesariamente un error)
+#   'no_cuadra'   -- no cuadra con ningun candidato -- amerita revisar la
+#                    imagen original de la factura
+#   'sin_datos'   -- falta informacion (sin total, sin lineas, o algun
+#                    item sin subtotal) para poder comparar algo
+def validar_total_factura(total, impuesto, lineas):
+    if total is None:
+        return {'estado': 'sin_datos'}
+    subtotales = [linea['subtotal'] for linea in lineas]
+    if not subtotales or any(s is None for s in subtotales):
+        return {'estado': 'sin_datos'}
+
+    suma_subtotales = round(float(sum(subtotales)), 2)
+    total = float(total)
+    candidatos = [suma_subtotales]
+    if impuesto is not None:
+        candidatos.append(round(suma_subtotales + float(impuesto), 2))
+
+    if not any(abs(c - total) <= 0.5 for c in candidatos):
+        return {'estado': 'no_cuadra', 'suma_subtotales': suma_subtotales}
+    if (
+        impuesto is not None
+        and abs(suma_subtotales - total) <= 0.5
+        and abs(candidatos[-1] - total) > 0.5
+    ):
+        return {'estado': 'sin_impuesto', 'suma_subtotales': suma_subtotales}
+    return {'estado': 'ok', 'suma_subtotales': suma_subtotales}
+
 # Cliente de SSM Parameter Store -- se crea una sola vez, a nivel de modulo,
 # para no reconstruirlo en cada peticion HTTP.
 ssm = boto3.client('ssm', region_name='us-east-1')
@@ -170,6 +212,8 @@ PANEL_HTML = """
         .factura h3 { margin: 0 0 6px 0; }
         .factura .total { color: #FF9900; font-weight: bold; font-size: 18px; }
         .factura .impuesto { color: #555; font-size: 14px; margin-top: -4px; }
+        .factura .alerta-total { color: #B00020; font-size: 13px; background: #FCE8E8; border: 1px solid #F3C6C6; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
+        .factura .info-total { color: #444; font-size: 13px; background: #F0F0F0; border: 1px solid #DDD; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
         .factura table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
         .factura th, .factura td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #eee; }
         .vacio { color: #777; }
@@ -189,6 +233,15 @@ PANEL_HTML = """
         <p class="total">Total: {% if factura.total is not none %}${{ factura.total | cop }}{% else %}sin total detectado{% endif %}</p>
         {% if factura.impuesto is not none %}
         <p class="impuesto">Impuesto: ${{ factura.impuesto | cop }}</p>
+        {% endif %}
+        {% if factura.validacion.estado == 'no_cuadra' %}
+        <p class="alerta-total">
+            &#9888; El total no cuadra con la suma de los items (${{ factura.validacion.suma_subtotales | cop }}){% if factura.impuesto is not none %} ni sumandole el impuesto{% endif %} -- revisar la imagen original.
+        </p>
+        {% elif factura.validacion.estado == 'sin_impuesto' %}
+        <p class="info-total">
+            El total parece no incluir el impuesto por encima de la suma de items (${{ factura.validacion.suma_subtotales | cop }}).
+        </p>
         {% endif %}
         {% if factura.imagen_url %}
         <p><a href="{{ factura.imagen_url }}" target="_blank" rel="noopener">Ver imagen original de la factura</a></p>
@@ -273,7 +326,8 @@ def ver_facturas():
                 'impuesto': impuesto,
                 'fecha_procesado': fecha_procesado,
                 'lineas': lineas,
-                'imagen_url': imagen_url
+                'imagen_url': imagen_url,
+                'validacion': validar_total_factura(total, impuesto, lineas)
             })
         return render_template_string(PANEL_HTML, facturas=facturas)
     finally:
