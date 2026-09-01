@@ -389,6 +389,16 @@ Al implementar la comparación se encontró y corrigió un bug propio, antes de 
 
 Verificado con seis casos simulados por separado (total que incluye impuesto y cuadra en silencio, total sin impuesto que genera el INFO nuevo, un caso que no cuadra con ningún candidato y genera el AVISO, dos variantes sin impuesto detectado por Textract, e impuesto detectado en cero) -- los seis se comportaron como se esperaba. El archivo compila sin errores de sintaxis.
 
+### 5.30 Lección de despliegue y verificación de la sección 5.29 con datos reales
+
+Al conseguir una captura de mejor resolución de la factura de Dotaciones Gamero (pendiente de la sección 5.29) y procesarla, el aviso esperado en CloudWatch no apareció. La causa no fue un error de lógica: el código de la sección 5.29 se había editado, probado con simulaciones y sincronizado con GitHub, pero nunca se había desplegado a la función Lambda real -- subir código a GitHub no equivale a desplegarlo, y ese paso final se había quedado pendiente sin quedar marcado como tal. Se corrigió desplegando el código actualizado desde la consola de Lambda.
+
+**Verificación con datos reales: **al reprocesar la factura de Gamero con la Lambda ya actualizada, apareció el aviso esperado: "la suma de los subtotales de los items (6000000.0) no cuadra con el total de la factura (7912000.0), ni sumandole el impuesto detectado (912000.0) para dar 6912000.0". Es la primera vez que esta validación tiene un caso real que la dispara: la factura de Gamero tiene un error propio del proveedor al emitirla (su descuento y su IVA sí están bien calculados entre sí, pero el total impreso no coincide con esa aritmética), no un error de extracción.
+
+Adicionalmente, se agregó una segunda pieza pedida por el usuario: la misma reconciliación (suma de subtotales contra total, con o sin impuesto) ahora también se calcula y se muestra directamente en /facturas, no solo en los logs de CloudWatch. Se implementó como una función nueva (validar_total_factura) que se ejecuta al momento de renderizar el panel, leyendo lo que ya está guardado en RDS -- deliberadamente no como un valor que se calcula y se guarda una sola vez al procesar la factura, para que el chequeo aplique de una vez a las facturas ya procesadas anteriormente (incluida la propia Gamero) sin necesidad de reprocesarlas ni de una migración de datos. Cuando el total no cuadra con ningún candidato, se muestra una alerta visible junto al total y el impuesto de esa factura; cuando cuadra solo sin el impuesto, una nota informativa más discreta; cuando todo cuadra, el panel no muestra nada adicional, igual que el criterio ya usado en los logs. Verificado en el ambiente de pruebas: la factura de Gamero muestra la alerta correcta con el monto correcto de la suma de ítems.
+
+Efecto colateral encontrado al verificar: al reprocesar Gamero para probar el aviso de la Lambda, quedó duplicada en la base de datos (factura_id 46 de la primera prueba, con peor resolución, y 47 de la segunda). No afecta nada funcional, pero queda como pendiente de limpieza antes de depurar los datos de prueba (sección 5.21).
+
 ## 6. Estado actual del proyecto
 
 La versión 1 está completa, verificada de extremo a extremo y publicada como repositorio público en GitHub (ver el documento de la v1). No tiene pendientes técnicos abiertos.
@@ -411,6 +421,8 @@ Sigue sin decisión ni implementación si redondear las cifras del asistente de 
 
 Se agregó una segunda validación no bloqueante en la Lambda, ahora a nivel de factura completa: la suma de subtotales de los ítems contra el total detectado (sección 5.29), con dos candidatos de comparación (con y sin impuesto) para no generar avisos falsos, y un log INFO nuevo para medir con datos reales qué tan seguido el total de una factura no incluye el impuesto por encima de los subtotales.
 
+Esa validación quedó verificada de punta a punta con un caso real (sección 5.30): la Lambda desplegada generó el aviso esperado en CloudWatch al reprocesar una factura con un total que no cuadraba con su propia aritmética, y la misma reconciliación ya se muestra también directamente en /facturas -- calculada al momento de mostrar el panel, no solo al procesar, por lo que ya aplica a las facturas procesadas anteriormente sin necesidad de reprocesarlas.
+
 ## 7. Próximos pasos
 
 - Evaluar, sin fecha de cierre fija, si vale la pena rellenar (backfill) el impuesto de las facturas procesadas antes de la sección 5.28, a partir del JSON crudo que la Lambda ya guarda en datos_textract_raw (tipo jsonb) desde el principio, sin tener que volver a subir las imágenes (sección 5.28).
@@ -419,5 +431,5 @@ Se agregó una segunda validación no bloqueante en la Lambda, ahora a nivel de 
 - Evaluar, como mejora de calidad de datos y no de esta etapa, una comparación difusa (fuzzy matching) de nombres de proveedor, para consolidar variantes del mismo proveedor real que Textract extrae como textos distintos (secciones 5.5 y 5.14).
 - Evaluar, como mejora de robustez de menor prioridad, que las herramientas SQL devuelvan las cifras ya formateadas en pesos colombianos (reutilizando formatear_numero) en vez de dejar que el modelo las redondee él mismo al escribir el texto (sección 5.20).
 - Evaluar, si el uso real de la memoria conversacional lo justifica, ajustar HISTORIAL_MAXIMO_MENSAJES (hoy en 10 -- 5 preguntas y 5 respuestas) según cómo se comporte el costo real de tokens de entrada en la práctica.
-- Conseguir una captura de mejor resolución de la factura de Dotaciones Gamero (descartada en la sección 5.29 por texto borroso) y procesarla.
 - Revisar en unas semanas, con datos reales de producción, los logs INFO agregados en la sección 5.29 -- qué proporción de facturas cae en "el total no incluye el impuesto" -- para confirmar o corregir la suposición de que eso es la excepción y no la regla.
+- Borrar el registro duplicado de la factura de Dotaciones Gamero (factura_id 46, de la primera prueba con peor resolución) antes de depurar los datos de prueba (sección 5.21) -- se dejó ambas versiones mientras se verificaba la sección 5.30.
