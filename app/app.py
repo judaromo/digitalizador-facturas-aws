@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response
 import boto3
 import uuid
 from botocore.client import Config
@@ -8,6 +8,17 @@ import pg8000.native
 # consultas nuevas del panel (ultimos 30 dias, dia de hoy, etc.) sin
 # depender de que el usuario escriba las fechas a mano.
 from datetime import date, timedelta
+# xml_escape: para armar la respuesta TwiML del webhook de WhatsApp sin
+# que un mensaje del usuario que contenga "<", ">" o "&" rompa el XML.
+from xml.sax.saxutils import escape as xml_escape
+# RequestValidator: valida la firma que Twilio agrega a cada peticion del
+# webhook de WhatsApp. Se intento primero una implementacion manual del
+# algoritmo de firma (HMAC-SHA1 documentado por Twilio) -- funcionaba
+# correctamente, pero se descarto de todas formas: la propia
+# documentacion de Twilio pide explicitamente no reimplementar esto,
+# porque pueden agregar parametros nuevos sin aviso, y esta validacion
+# controla el acceso a una ruta que invoca a Bedrock (que tiene costo).
+from twilio.request_validator import RequestValidator
 
 app = Flask(__name__)
 s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
@@ -79,8 +90,8 @@ def validar_total_factura(total, impuesto, lineas):
 # para no reconstruirlo en cada peticion HTTP.
 ssm = boto3.client('ssm', region_name='us-east-1')
 
-BUCKET_NAME = 'facturas-microempresarios-<TU-CUENTA-AWS>'  # Consola S3 > nombre del bucket
-DB_HOST = '<TU-ENDPOINT-RDS>.rds.amazonaws.com'  # Consola RDS > Bases de datos > Punto de enlace (endpoint)
+BUCKET_NAME = 'facturas-microempresarios-<TU-CUENTA-AWS>'
+DB_HOST = '<TU-ENDPOINT-RDS>.rds.amazonaws.com'
 DB_PORT = 5432
 DB_NAME = 'facturas'
 DB_USER = 'postgres'
@@ -92,6 +103,21 @@ DB_PASSWORD = ssm.get_parameter(
     Name='/facturas-app/rds-password',
     WithDecryption=True
 )['Parameter']['Value']
+
+# Mismo criterio que DB_PASSWORD: el Auth Token de Twilio se usa para
+# validar la firma de cada peticion al webhook de WhatsApp (ver
+# validar_firma_twilio), asi que es tan sensible como una contraseña -- no
+# va escrito en el codigo. Crear este parametro en SSM Parameter Store
+# (tipo SecureString) con el Auth Token que aparece en la consola de
+# Twilio, en la pagina principal del proyecto ("Account Info").
+TWILIO_AUTH_TOKEN = ssm.get_parameter(
+    Name='/facturas-app/twilio-auth-token',
+    WithDecryption=True
+)['Parameter']['Value']
+
+# Se crea una sola vez, a nivel de modulo, igual que los clientes de
+# boto3 -- se reutiliza en cada peticion al webhook de WhatsApp.
+validador_twilio = RequestValidator(TWILIO_AUTH_TOKEN)
 
 PAGINA_HTML = """
 <!DOCTYPE html>
@@ -890,7 +916,7 @@ bedrock_runtime = boto3.client('bedrock-runtime', region_name='us-east-1')
 # profile (no el ID plano del modelo) cuando el modelo lo exige -- este es
 # justo ese caso, confirmado en la consola de Bedrock (Claude Haiku 4.5
 # aparece como "Cross-region inference").
-ID_MODELO_ASISTENTE = 'arn:aws:bedrock:us-east-1:<TU-CUENTA-AWS>:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0'  # Consola Bedrock > Cross-region inference > ARN del perfil
+ID_MODELO_ASISTENTE = 'arn:aws:bedrock:us-east-1:<TU-CUENTA-AWS>:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0'
 
 # Definicion de las "herramientas" que el modelo puede pedir usar. Cada una
 # corresponde exactamente a una de las funciones de consulta ya definidas
@@ -1466,6 +1492,112 @@ ASISTENTE_HTML = """
 @app.route('/asistente')
 def asistente():
     return render_template_string(ASISTENTE_HTML)
+
+
+# =====================================================================
+# Segundo canal del asistente: WhatsApp, via el WhatsApp Sandbox de
+# Twilio. Prueba de concepto -- el Sandbox de Twilio es un entorno de
+# pruebas (quien quiera escribirle al bot tiene que primero enviar un
+# codigo "join" desde su propio WhatsApp), no un canal apto para
+# usuarios finales reales todavia; para eso Twilio requiere verificacion
+# de WhatsApp Business, un proceso fuera del control de este proyecto
+# (ver bitacora, decision de canal del asistente).
+#
+# Reutiliza procesar_pregunta() tal cual -- la misma logica de
+# herramientas/Bedrock que ya usa /chat. Lo unico nuevo aqui es la
+# "puerta de entrada": donde /chat recibe el historial desde el
+# navegador (ver nota de diseno junto a procesar_pregunta), WhatsApp no
+# tiene navegador que lo guarde, asi que el historial se guarda en una
+# tabla nueva de RDS, indexada por numero de telefono -- la misma idea
+# de fondo (la base de datos compartida como fuente de verdad entre las
+# dos instancias EC2, no la memoria de una sola instancia), aplicada al
+# unico lugar donde SI hace falta que el servidor recuerde algo.
+#
+# Tabla nueva requerida (crearla una sola vez, via psql, antes de usar
+# este canal):
+#
+#   CREATE TABLE whatsapp_historial (
+#       id SERIAL PRIMARY KEY,
+#       telefono TEXT NOT NULL,
+#       rol TEXT NOT NULL CHECK (rol IN ('user', 'assistant')),
+#       texto TEXT NOT NULL,
+#       creado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+#   );
+#   CREATE INDEX idx_whatsapp_historial_telefono ON whatsapp_historial (telefono, creado_en);
+# =====================================================================
+
+# Devuelve los ultimos "limite" turnos de la conversacion de WhatsApp con
+# un numero de telefono especifico, en el mismo formato que espera
+# procesar_pregunta() ({'role': ..., 'texto': ...}), ordenados del mas
+# antiguo al mas reciente (Bedrock espera el historial en ese orden).
+def obtener_historial_whatsapp(conexion, telefono, limite):
+    filas = conexion.run(
+        """
+        SELECT rol, texto FROM whatsapp_historial
+        WHERE telefono = :telefono
+        ORDER BY creado_en DESC
+        LIMIT :limite
+        """,
+        telefono=telefono,
+        limite=limite
+    )
+    return [{'role': fila[0], 'texto': fila[1]} for fila in reversed(filas)]
+
+
+# Guarda un turno (del usuario o del asistente) en el historial de
+# WhatsApp de un numero especifico.
+def guardar_turno_whatsapp(conexion, telefono, rol, texto):
+    conexion.run(
+        "INSERT INTO whatsapp_historial (telefono, rol, texto) VALUES (:telefono, :rol, :texto)",
+        telefono=telefono, rol=rol, texto=texto
+    )
+
+
+# Limite de turnos de historial para WhatsApp -- mismo valor que
+# HISTORIAL_MAXIMO_MENSAJES (linea ~1058) para no encarecer cada mensaje
+# con una conversacion indefinidamente larga, mismo criterio que /chat.
+HISTORIAL_MAXIMO_MENSAJES_WHATSAPP = HISTORIAL_MAXIMO_MENSAJES
+
+@app.route('/whatsapp-webhook', methods=['POST'])
+def whatsapp_webhook():
+    # "not firma_recibida" se revisa ANTES de llamar a validate(): si el
+    # header no viene (ej. alguien llamando a esta URL directamente, sin
+    # pasar por Twilio), el propio metodo validate() del SDK lanza una
+    # excepcion en vez de devolver False -- se evita por completo
+    # llamandolo solo cuando si hay una firma que comparar.
+    firma_recibida = request.headers.get('X-Twilio-Signature')
+    if not firma_recibida or not validador_twilio.validate(request.url, request.form.to_dict(), firma_recibida):
+        # 403 generico, sin detalle -- no le da a un atacante ninguna
+        # pista de por que fallo la validacion.
+        return Response(status=403)
+
+    telefono = request.form.get('From', '')
+    pregunta = (request.form.get('Body') or '').strip()
+
+    if not telefono or not pregunta:
+        respuesta_texto = 'No recibi ningun mensaje de texto para responder.'
+    else:
+        conexion = pg8000.native.Connection(
+            user=DB_USER, password=DB_PASSWORD,
+            host=DB_HOST, port=DB_PORT, database=DB_NAME
+        )
+        try:
+            historial = obtener_historial_whatsapp(conexion, telefono, HISTORIAL_MAXIMO_MENSAJES_WHATSAPP)
+            respuesta_texto = procesar_pregunta(historial, pregunta)
+            guardar_turno_whatsapp(conexion, telefono, 'user', pregunta)
+            guardar_turno_whatsapp(conexion, telefono, 'assistant', respuesta_texto)
+        finally:
+            conexion.close()
+
+    # TwiML: el formato XML que Twilio espera como respuesta para saber
+    # que decirle de vuelta al usuario por WhatsApp. xml_escape evita que
+    # un mensaje (la pregunta del usuario influye indirectamente en la
+    # respuesta del modelo) con "<", ">" o "&" rompa el XML.
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response><Message>' + xml_escape(respuesta_texto) + '</Message></Response>'
+    )
+    return Response(twiml, mimetype='text/xml')
 
 
 if __name__ == '__main__':
