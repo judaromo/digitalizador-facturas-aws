@@ -423,6 +423,18 @@ El despliegue de la sección 5.31 no salió limpio en el primer intento -- al co
 
 Pendiente, sin relación con el funcionamiento del canal: sincronizar a GitHub el código ya desplegado (la ruta `/whatsapp-webhook`, la tabla `whatsapp_historial` y la dependencia `twilio` en `requirements.txt`) -- por ahora existe en las instancias EC2 pero no en el repositorio.
 
+### 5.33 Implementación: NIT del proveedor como campo propio en /facturas
+
+Al probar un lote nuevo de facturas reales (dos casos: una factura electrónica de Baterías Colombia SAS y una factura física manuscrita del Hotel Prado del Huila, esta última emitida a nombre de la persona natural titular, Natalia Andrea Díaz Céspedes, régimen no responsable de IVA), se confirmó por evidencia de CloudWatch que ni la Lambda ni /facturas capturaban el NIT del proveedor en ningún momento -- no es que el dato se perdiera en el camino, es que nunca se pidió. El resumen de log solo imprimía Proveedor, Fecha, Total, Impuesto e Items (ver `lambda_procesar_factura.py`, función `lambda_handler`); el NIT no aparecía ni ahí ni en ninguna columna de `factura`.
+
+Antes de tocar código, se verificó contra la documentación oficial de Textract cuál es el campo estándar correcto para este dato, en vez de asumir un nombre por analogía con `VENDOR_NAME` -- un supuesto que habría sido plausible pero incorrecto: no existe un campo `VENDOR_TAX_ID`. El campo real es `TAX_PAYER_ID`, genérico para cualquier país (a diferencia de `VENDOR_VAT_NUMBER`, `VENDOR_GST_NUMBER`, `VENDOR_ABN_NUMBER` o `VENDOR_PAN_NUMBER`, que son esquemas tributarios específicos de otras regiones). Como `extraer_campos_generales()` ya recorre todos los `SummaryFields` que Textract devuelve sin filtrar por tipo, no hizo falta tocar esa función -- `campos.get('TAX_PAYER_ID')` alcanza para leerlo.
+
+Misma implementación en tres piezas que la sección 5.28 (impuesto): primero, en RDS, `ALTER TABLE factura ADD COLUMN nit VARCHAR`, permitiendo nulos y sin valor por defecto, pendiente de que el usuario lo ejecute vía psql -- no se aplicó desde aquí porque esta sesión no tiene acceso a la base de datos ni a la cuenta de AWS. Segundo, en la Lambda: se agregó la extracción de `TAX_PAYER_ID` a `guardar_en_rds()` y al log de resumen, guardado como texto sin limpiar (a diferencia de `limpiar_numero()`, aquí no aplica ninguna transformación -- un NIT es un identificador, no una cantidad, así que los puntos y el guion se conservan tal como Textract los devuelve). Tercero, en `/facturas`: una línea "NIT: X" bajo el nombre del proveedor, visible solo cuando el dato existe -- mismo criterio que la línea de impuesto, para que las facturas procesadas antes de este cambio no muestren un campo vacío.
+
+**Pendiente, igual que con el impuesto en su momento (sección 5.28):** el backfill del NIT para las 48 facturas ya procesadas antes de este cambio. Es parcialmente recuperable sin volver a subir las imágenes, porque `datos_textract_raw` guarda desde el principio el JSON crudo de `campos` -- para las facturas donde Textract sí detectó `TAX_PAYER_ID` en su momento, el valor ya está ahí, solo sin extraer a su propia columna.
+
+**Pendiente de despliegue real**, no solo de código: tanto la Lambda como `app.py` necesitan desplegarse de nuevo después de este cambio (subir la función en la consola de Lambda, y actualizar `app.py` en las instancias del Auto Scaling Group) -- la sección 5.30 ya documentó que sincronizar a GitHub no equivale a desplegar, así que este paso no se puede dar por hecho.
+
 ## 6. Estado actual del proyecto
 
 La versión 1 está completa, verificada de extremo a extremo y publicada como repositorio público en GitHub (ver el documento de la v1). No tiene pendientes técnicos abiertos.
