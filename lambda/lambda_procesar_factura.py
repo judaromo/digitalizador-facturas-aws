@@ -247,13 +247,25 @@ def guardar_en_rds(campos, items, s3_key):
         # None y limpiar_numero lo deja en None tambien -- se guarda como
         # NULL en la base de datos, nunca como 0 (0 significaria "el
         # impuesto es cero", que es una afirmacion distinta a "no se sabe").
+        #
+        # 'TAX_PAYER_ID' es el campo estandar que Textract usa para la
+        # identificacion tributaria del vendedor (el NIT, en el caso
+        # colombiano) -- ver seccion 5.33. No existe un campo especifico
+        # 'NIT' ni 'VENDOR_TAX_ID' en AnalyzeExpense: TAX_PAYER_ID es el
+        # campo generico que cubre este dato sin importar el pais (se
+        # verifico contra la documentacion oficial antes de usarlo, para no
+        # apostar a un nombre de campo inventado). Se guarda como texto tal
+        # cual lo devuelve Textract, sin limpiar puntos ni guiones -- a
+        # diferencia de un campo numerico, el NIT es un identificador, no
+        # una cantidad para operar aritmeticamente.
         resultado = conexion.run(
             """
-            INSERT INTO factura (proveedor_nombre, fecha_factura, total, impuesto, s3_key, datos_textract_raw)
-            VALUES (:proveedor, :fecha, :total, :impuesto, :s3_key, :raw)
+            INSERT INTO factura (proveedor_nombre, nit, fecha_factura, total, impuesto, s3_key, datos_textract_raw)
+            VALUES (:proveedor, :nit, :fecha, :total, :impuesto, :s3_key, :raw)
             RETURNING factura_id
             """,
             proveedor=campos.get('VENDOR_NAME'),
+            nit=campos.get('TAX_PAYER_ID'),
             fecha=parsear_fecha(campos.get('INVOICE_RECEIPT_DATE')),
             total=limpiar_numero(campos.get('TOTAL')),
             impuesto=limpiar_numero(campos.get('TAX')),
@@ -400,6 +412,7 @@ def lambda_handler(event, context):
 
     print("===== RESUMEN DE LA FACTURA =====")
     print(f"Proveedor: {campos.get('VENDOR_NAME', 'No detectado')}")
+    print(f"NIT: {campos.get('TAX_PAYER_ID', 'No detectado')}")
     print(f"Fecha detectada: {campos.get('INVOICE_RECEIPT_DATE', 'No detectada')} -> {parsear_fecha(campos.get('INVOICE_RECEIPT_DATE'))}")
     print(f"Total: {campos.get('TOTAL', 'No detectado')}")
     print(f"Impuesto: {campos.get('TAX', 'No detectado')}")

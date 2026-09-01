@@ -238,6 +238,7 @@ PANEL_HTML = """
         .factura h3 { margin: 0 0 6px 0; }
         .factura .total { color: #FF9900; font-weight: bold; font-size: 18px; }
         .factura .impuesto { color: #555; font-size: 14px; margin-top: -4px; }
+        .factura .nit { color: #777; font-size: 13px; margin: -4px 0 6px 0; }
         .factura .alerta-total { color: #B00020; font-size: 13px; background: #FCE8E8; border: 1px solid #F3C6C6; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
         .factura .info-total { color: #444; font-size: 13px; background: #F0F0F0; border: 1px solid #DDD; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
         .factura table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
@@ -255,6 +256,9 @@ PANEL_HTML = """
     {% for factura in facturas %}
     <div class="factura">
         <h3>{{ factura.proveedor_nombre or 'Proveedor no detectado' }}</h3>
+        {% if factura.nit %}
+        <p class="nit">NIT: {{ factura.nit }}</p>
+        {% endif %}
         <p>Procesada: {{ factura.fecha_procesado }}</p>
         <p class="total">Total: {% if factura.total is not none %}${{ factura.total | cop }}{% else %}sin total detectado{% endif %}</p>
         {% if factura.impuesto is not none %}
@@ -318,11 +322,11 @@ def ver_facturas():
         # el dato de todas las facturas ya procesadas estaba disponible,
         # solo no se estaba leyendo ni mostrando.
         filas_factura = conexion.run(
-            "SELECT factura_id, proveedor_nombre, total, impuesto, fecha_procesado, s3_key FROM factura ORDER BY fecha_procesado DESC"
+            "SELECT factura_id, proveedor_nombre, nit, total, impuesto, fecha_procesado, s3_key FROM factura ORDER BY fecha_procesado DESC"
         )
         facturas = []
         for fila in filas_factura:
-            factura_id, proveedor, total, impuesto, fecha_procesado, s3_key = fila
+            factura_id, proveedor, nit, total, impuesto, fecha_procesado, s3_key = fila
             filas_item = conexion.run(
                 "SELECT descripcion, cantidad, precio_unitario, subtotal FROM item_factura WHERE factura_id = :fid",
                 fid=factura_id
@@ -348,6 +352,7 @@ def ver_facturas():
                 )
             facturas.append({
                 'proveedor_nombre': proveedor,
+                'nit': nit,
                 'total': total,
                 'impuesto': impuesto,
                 'fecha_procesado': fecha_procesado,
