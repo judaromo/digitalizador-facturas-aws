@@ -25,7 +25,10 @@ Bedrock) para consultar los datos en lenguaje natural.
 5. Los datos ya estructurados se guardan en una base de datos PostgreSQL
    (Amazon RDS).
 6. Un panel de consulta (`/facturas`) muestra todas las facturas procesadas,
-   con sus ítems, directamente desde la base de datos.
+   con sus ítems, directamente desde la base de datos — incluyendo una
+   alerta visible cuando la suma de los ítems no reconcilia con el total
+   de la factura (con o sin impuesto), calculada al momento de mostrar el
+   panel, así que aplica también a facturas ya procesadas.
 7. Un panel visual (`/panel`) resume el gasto (a partir de las facturas) y
    la venta diaria (registrada manualmente) con indicadores y una gráfica
    de tendencia (Chart.js).
