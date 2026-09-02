@@ -226,10 +226,60 @@ def parsear_fecha(texto):
     except ValueError:
         return None
 
+# Reconoce si un texto tiene "forma" de NIT colombiano: una tira de 9 o 10
+# digitos una vez quitados puntos, espacios o guiones (ej. '901640801',
+# '901143842 7', '900.534.356-3'). Se compara la cantidad de digitos, no el
+# texto crudo, porque el formato varia bastante entre facturas.
+def _parece_nit(texto):
+    solo_digitos = re.sub(r'\D', '', texto or '')
+    return len(solo_digitos) in (9, 10)
+
+# Busca el NIT del proveedor entre los SummaryFields sin filtrar de
+# Textract, como respaldo cuando 'TAX_PAYER_ID' no aparece -- ver seccion
+# 5.34: en las facturas colombianas probadas, Textract nunca devolvio ese
+# campo. En su lugar, el NIT aparece clasificado como el tipo generico
+# 'OTHER', junto con datos sin relacion (numero de factura, NIT del
+# cliente, NIT del proveedor del software de facturacion, etc.).
+#
+# Heuristica, NO garantizada: se recorren todos los campos 'OTHER' en el
+# orden en que Textract los devuelve -- que en la practica sigue de cerca
+# el orden de lectura del documento -- y se toma el primer valor con forma
+# de NIT. El emisor de una factura casi siempre encabeza el documento antes
+# que el cliente o el pie de pagina, asi que el primer candidato suele ser
+# el correcto, pero esto es una apuesta sobre el orden tipico de una
+# factura, no una lectura de un campo dedicado -- a diferencia de
+# VENDOR_NAME o TOTAL, que si vienen de un campo especifico de Textract.
+# Si aparece mas de un candidato (como en la factura de prueba de Baterias
+# Colombia, con tres: proveedor, cliente y software de facturacion), se dej
+# a un aviso no bloqueante en el log para poder revisar despues cuales
+# facturas cayeron en el caso ambiguo -- mismo criterio que ya usa
+# guardar_en_rds para las reconciliaciones que no cuadran.
+def extraer_nit_probable(response):
+    documento = response['ExpenseDocuments'][0]
+    candidatos = [
+        field.get('ValueDetection', {}).get('Text', '')
+        for field in documento['SummaryFields']
+        if field['Type']['Text'] == 'OTHER'
+        and _parece_nit(field.get('ValueDetection', {}).get('Text', ''))
+    ]
+
+    if not candidatos:
+        return None
+    if len(candidatos) > 1:
+        print(
+            f"AVISO: se encontraron {len(candidatos)} valores con forma de "
+            f"NIT dentro de los campos OTHER {candidatos} -- se uso el "
+            f"primero ({candidatos[0]!r}) como NIT del proveedor, sin "
+            f"garantia de que sea el correcto (podria ser el del cliente o "
+            f"el de un tercero, como el proveedor del software de "
+            f"facturacion)."
+        )
+    return candidatos[0]
+
 # Se conecta a RDS, inserta una fila en 'factura' con los datos generales,
 # y una fila en 'item_factura' por cada item detectado, enlazadas mediante
 # el factura_id que genera la base de datos automaticamente.
-def guardar_en_rds(campos, items, s3_key):
+def guardar_en_rds(campos, items, s3_key, nit):
     conexion = pg8000.native.Connection(
         user=DB_USER,
         password=DB_PASSWORD,
@@ -248,14 +298,11 @@ def guardar_en_rds(campos, items, s3_key):
         # NULL en la base de datos, nunca como 0 (0 significaria "el
         # impuesto es cero", que es una afirmacion distinta a "no se sabe").
         #
-        # 'TAX_PAYER_ID' es el campo estandar que Textract usa para la
-        # identificacion tributaria del vendedor (el NIT, en el caso
-        # colombiano) -- ver seccion 5.33. No existe un campo especifico
-        # 'NIT' ni 'VENDOR_TAX_ID' en AnalyzeExpense: TAX_PAYER_ID es el
-        # campo generico que cubre este dato sin importar el pais (se
-        # verifico contra la documentacion oficial antes de usarlo, para no
-        # apostar a un nombre de campo inventado). Se guarda como texto tal
-        # cual lo devuelve Textract, sin limpiar puntos ni guiones -- a
+        # 'nit' llega ya resuelto desde lambda_handler: primero se intenta
+        # 'TAX_PAYER_ID' (el campo estandar de Textract para esto -- ver
+        # seccion 5.33), y si no aparece, se cae a extraer_nit_probable()
+        # (la heuristica de la seccion 5.34, sobre los campos 'OTHER'). Se
+        # guarda como texto tal cual, sin limpiar puntos ni guiones -- a
         # diferencia de un campo numerico, el NIT es un identificador, no
         # una cantidad para operar aritmeticamente.
         resultado = conexion.run(
@@ -265,7 +312,7 @@ def guardar_en_rds(campos, items, s3_key):
             RETURNING factura_id
             """,
             proveedor=campos.get('VENDOR_NAME'),
-            nit=campos.get('TAX_PAYER_ID'),
+            nit=nit,
             fecha=parsear_fecha(campos.get('INVOICE_RECEIPT_DATE')),
             total=limpiar_numero(campos.get('TOTAL')),
             impuesto=limpiar_numero(campos.get('TAX')),
@@ -410,16 +457,22 @@ def lambda_handler(event, context):
     campos = extraer_campos_generales(response)
     items = extraer_items(response)
 
+    # Primero se intenta el campo estandar de Textract (TAX_PAYER_ID); si no
+    # aparece -- el caso visto en todas las facturas colombianas probadas
+    # hasta ahora -- se cae a la heuristica sobre los campos 'OTHER' (ver
+    # extraer_nit_probable, seccion 5.34).
+    nit = campos.get('TAX_PAYER_ID') or extraer_nit_probable(response)
+
     print("===== RESUMEN DE LA FACTURA =====")
     print(f"Proveedor: {campos.get('VENDOR_NAME', 'No detectado')}")
-    print(f"NIT: {campos.get('TAX_PAYER_ID', 'No detectado')}")
+    print(f"NIT: {nit or 'No detectado'}")
     print(f"Fecha detectada: {campos.get('INVOICE_RECEIPT_DATE', 'No detectada')} -> {parsear_fecha(campos.get('INVOICE_RECEIPT_DATE'))}")
     print(f"Total: {campos.get('TOTAL', 'No detectado')}")
     print(f"Impuesto: {campos.get('TAX', 'No detectado')}")
     print(f"Items detectados: {len(items)}")
     print("==================================")
 
-    factura_id = guardar_en_rds(campos, items, key)
+    factura_id = guardar_en_rds(campos, items, key, nit)
 
     return {
         'statusCode': 200,
