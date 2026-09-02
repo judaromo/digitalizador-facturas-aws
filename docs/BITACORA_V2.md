@@ -461,6 +461,22 @@ Resultado: la fecha sí quedó parcialmente detectada por Textract, pero fragmen
 
 No hubo cambio de código en esta sección: es una investigación que confirma la causa raíz y documenta la decisión de no corregir, no una corrección.
 
+### 5.36 Formulario de edicion manual de facturas
+
+Primera pieza de una lista de tres mejoras pedidas por el usuario (2026-09-02): habilitar la correccion manual de datos que Textract lee mal, mejorar la plantilla visual de `/facturas` (mostrando campos que ya se guardan en `datos_textract_raw` pero no se muestran, como telefono o direccion), y evaluar opciones para consolidar la navegacion entre paneles en un solo dashboard. Se decidio empezar por la edicion manual, por ser la pieza de mayor impacto: ataca la causa de fondo detras de varias limitaciones ya documentadas (fecha no detectada, NIT ambiguo, formato de dos lineas por item), en vez de seguir puliendo heuristicas de extraccion caso por caso.
+
+**Decision de alcance (del usuario, via preguntas de aclaracion antes de escribir codigo):** formulario dedicado por factura (no edicion en linea sobre `/facturas`), consistente con el resto del sitio, que no usa JavaScript pesado hoy.
+
+**Implementacion:** ruta nueva `GET/POST /facturas/<id>/editar`. El GET arma un formulario precargado con lo que hay guardado (proveedor, NIT, fecha de factura, total, impuesto, y una fila editable por cada item). El POST actualiza `factura` e `item_factura` con `UPDATE`s parametrizados, y marca la factura con dos columnas nuevas: `editado_manualmente BOOLEAN` y `fecha_ultima_edicion TIMESTAMP` -- para poder distinguir en `/facturas` un dato que viene de Textract de uno corregido a mano, mismo criterio de trazabilidad que ya sigue el resto del proyecto (NULL vs. 0, avisos en vez de silencio). `/facturas` ahora tambien trae `factura_id` en el diccionario que llega a la plantilla -- antes se descartaba despues de usarse para la consulta de items, asi que no habria sido posible enlazar a la edicion de cada tarjeta sin ese cambio.
+
+Los campos numericos del formulario se leen con inputs `type="number"`, que segun el estandar HTML siempre envian el valor con punto como separador decimal sin importar el idioma del navegador -- a diferencia de `limpiar_numero()` (que interpreta texto libre de Textract con dos convenciones posibles), aqui no hace falta ninguna deteccion de convencion, solo distinguir "vacio" de "el usuario escribio un numero" (`campo_numerico_o_none`, `campo_texto_o_none`, `campo_fecha_o_none`). Si el usuario borra un campo a proposito porque no puede confirmar el valor correcto en la imagen, se guarda `NULL`, nunca un valor inventado.
+
+**Decision explicita de alcance, no un descuido:** esta primera version no permite agregar ni quitar filas de items, solo corregir los valores de las filas que la Lambda ya creo. Resuelve el problema pedido (dato mal leido); agregar/quitar filas queda como mejora futura opcional si aparecen casos reales de items faltantes o de mas.
+
+**Verificacion:** los dos templates nuevos/modificados (`PANEL_HTML`, `EDITAR_FACTURA_HTML`) se probaron por separado con Jinja2 puro, con datos variados (factura editada y sin editar, con y sin fecha, con y sin items) para confirmar que renderizan sin error de sintaxis antes del despliegue real -- no fue posible una prueba end-to-end contra RDS desde esta sesion, que no tiene acceso a la base de datos ni a la cuenta de AWS (mismo limite que en las secciones 5.33/5.34). Los tres helpers de parseo (`campo_texto_o_none`, `campo_numerico_o_none`, `campo_fecha_o_none`) se probaron por separado con casos de borde (vacio, con espacios, `None`, fecha invalida).
+
+**Pendiente de aplicar por el usuario, no solo de codigo:** la migracion `ALTER TABLE factura ADD COLUMN editado_manualmente BOOLEAN NOT NULL DEFAULT FALSE; ALTER TABLE factura ADD COLUMN fecha_ultima_edicion TIMESTAMP;` (via psql, mismo patron que impuesto y NIT), y el despliegue del `app.py` actualizado a las instancias EC2 del Auto Scaling Group -- la seccion 5.30 ya documento que sincronizar a GitHub no equivale a desplegar.
+
 ## 6. Estado actual del proyecto
 
 La versión 1 está completa, verificada de extremo a extremo y publicada como repositorio público en GitHub (ver el documento de la v1). No tiene pendientes técnicos abiertos.
@@ -491,6 +507,9 @@ Se probó un lote nuevo de facturas colombianas reales dirigido a los tres casos
 
 ## 7. Próximos pasos
 
+- Aplicar la migración de la sección 5.36 (`editado_manualmente`, `fecha_ultima_edicion` en `factura`) vía psql, y desplegar el `app.py` actualizado a las instancias EC2 -- pendiente de despliegue real, no solo de código.
+- Punto 2 de la lista del usuario (2026-09-02): mostrar en `/facturas` (y hacer editables, con columnas propias en `factura`) los campos que Textract ya trae pero hoy no se guardan en columnas propias -- teléfono y dirección del proveedor y del comprador, número de factura -- confirmados en `datos_textract_raw` de facturas reales ya procesadas. Alcance acordado: solo los campos que Textract sí detecta en la práctica, no la plantilla DIAN completa (que incluye datos como resolución de autorización, código CIIU o tarifa ICA que `AnalyzeExpense` no está diseñado para reconocer).
+- Punto 3 de la lista del usuario (2026-09-02): evaluar opciones para consolidar la navegación entre `/`, `/facturas`, `/panel`, `/registrar-venta` y `/asistente` en un dashboard único, minimizando el cambio de ventanas -- sin decisión tomada todavía sobre el enfoque (pestañas sobre una sola página vs. reescritura con un framework de frontend).
 - Si aparecen muchas facturas reales con el formato de fecha en casillas separadas (DIA/MES/AÑO), evaluar la mejora basada en geometría de campos que quedó evaluada y descartada por ahora en la sección 5.35.
 - Evaluar, sin fecha de cierre fija, si vale la pena rellenar (backfill) el impuesto y el NIT de las facturas procesadas antes de las secciones 5.28 y 5.33, a partir del JSON crudo que la Lambda ya guarda en datos_textract_raw (tipo jsonb) desde el principio, sin tener que volver a subir las imágenes.
 - Revisar con datos reales de producción, después de que se acumulen más facturas, qué tan seguido aparece el `AVISO` de múltiples candidatos de NIT (sección 5.34) -- si es frecuente, valorar la mejora basada en geometría de campos que quedó evaluada y descartada por ahora en esa misma sección.

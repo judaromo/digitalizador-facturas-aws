@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string, Response
+from flask import Flask, request, jsonify, render_template_string, Response, redirect, url_for
 import boto3
 import uuid
 from botocore.client import Config
@@ -43,6 +43,55 @@ def formatear_numero(valor, decimales=2):
 # Registra formatear_numero como un filtro de Jinja llamado "cop", para
 # poder usarlo directamente en las plantillas HTML como {{ valor | cop }}.
 app.jinja_env.filters['cop'] = formatear_numero
+
+
+# ---- Helpers para el formulario de edicion manual de facturas ----
+#
+# A diferencia de limpiar_numero() (que interpreta texto libre leido por
+# Textract, con simbolos de moneda y las dos convenciones de separador
+# decimal), estos helpers leen campos de un formulario HTML propio: los
+# inputs type="number" siempre envian su valor con punto como separador
+# decimal sin importar el idioma del navegador (es un requisito del
+# estandar HTML, no una eleccion de este proyecto), asi que no hace falta
+# ninguna deteccion de convencion aqui -- solo distinguir "vacio" de "el
+# usuario escribio un numero".
+
+# Convierte un campo de texto del formulario a None si quedo vacio (en vez
+# de guardar una cadena vacia ''), para que se comporte igual que un dato
+# que Textract nunca detecto -- mismo criterio de NULL en toda la app.
+def campo_texto_o_none(valor):
+    if valor is None:
+        return None
+    valor = valor.strip()
+    return valor if valor else None
+
+
+# Igual que campo_texto_o_none, pero convierte a float. Si el usuario borra
+# el campo a proposito (porque el dato que Textract leyo esta mal y no hay
+# forma de saber el valor correcto a partir de la imagen), se guarda como
+# NULL, nunca como 0 -- 0 significaria "el valor es cero", una afirmacion
+# distinta a "no se sabe".
+def campo_numerico_o_none(valor):
+    if valor is None:
+        return None
+    valor = valor.strip()
+    if not valor:
+        return None
+    return float(valor)
+
+
+# Igual que los anteriores, para el campo de fecha (input type="date", que
+# entrega 'AAAA-MM-DD' o cadena vacia). date.fromisoformat() es estricto
+# con ese formato exacto, que es justo lo que un input type="date" nunca
+# deja de cumplir cuando trae un valor -- el try/except es solo defensivo,
+# no se espera que dispare en uso normal.
+def campo_fecha_o_none(valor):
+    if not valor:
+        return None
+    try:
+        return date.fromisoformat(valor)
+    except ValueError:
+        return None
 
 # Reconciliacion de factura completa: MISMA logica que la validacion que
 # ya existe en la Lambda (lambda_procesar_factura.py, guardar_en_rds,
@@ -241,6 +290,8 @@ PANEL_HTML = """
         .factura .nit { color: #777; font-size: 13px; margin: -4px 0 6px 0; }
         .factura .alerta-total { color: #B00020; font-size: 13px; background: #FCE8E8; border: 1px solid #F3C6C6; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
         .factura .info-total { color: #444; font-size: 13px; background: #F0F0F0; border: 1px solid #DDD; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
+        .factura .editado { color: #666; font-size: 12px; font-weight: normal; background: #EEE; border-radius: 4px; padding: 2px 6px; margin-left: 6px; }
+        .factura .editar { display: inline-block; margin-top: 8px; font-size: 13px; }
         .factura table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
         .factura th, .factura td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #eee; }
         .vacio { color: #777; }
@@ -255,11 +306,12 @@ PANEL_HTML = """
     {% endif %}
     {% for factura in facturas %}
     <div class="factura">
-        <h3>{{ factura.proveedor_nombre or 'Proveedor no detectado' }}</h3>
+        <h3>{{ factura.proveedor_nombre or 'Proveedor no detectado' }}{% if factura.editado_manualmente %}<span class="editado">editado a mano</span>{% endif %}</h3>
         {% if factura.nit %}
         <p class="nit">NIT: {{ factura.nit }}</p>
         {% endif %}
         <p>Procesada: {{ factura.fecha_procesado }}</p>
+        <p>Fecha de factura: {% if factura.fecha_factura %}{{ factura.fecha_factura }}{% else %}no detectada{% endif %}</p>
         <p class="total">Total: {% if factura.total is not none %}${{ factura.total | cop }}{% else %}sin total detectado{% endif %}</p>
         {% if factura.impuesto is not none %}
         <p class="impuesto">Impuesto: ${{ factura.impuesto | cop }}</p>
@@ -276,6 +328,7 @@ PANEL_HTML = """
         {% if factura.imagen_url %}
         <p><a href="{{ factura.imagen_url }}" target="_blank" rel="noopener">Ver imagen original de la factura</a></p>
         {% endif %}
+        <p class="editar"><a href="/facturas/{{ factura.factura_id }}/editar">Editar esta factura &rarr;</a></p>
         <table>
             <tr><th>Descripcion</th><th>Cant.</th><th>Precio</th><th>Subtotal</th></tr>
             {% for item in factura.lineas %}
@@ -289,6 +342,93 @@ PANEL_HTML = """
         </table>
     </div>
     {% endfor %}
+</body>
+</html>
+"""
+
+# Plantilla del formulario de edicion manual (punto 1 de la lista de
+# mejoras que pidio el usuario, 2026-09-02). Deliberadamente NO agrega ni
+# quita filas de items en esta primera version -- solo corrige los valores
+# de las filas que ya creo la Lambda al procesar la factura. Agregar/quitar
+# items queda anotado como mejora futura opcional en la bitacora, mismo
+# criterio que otras limitaciones ya documentadas: no es el problema que
+# se pidio resolver aqui (dato mal leido, no item faltante).
+EDITAR_FACTURA_HTML = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Editar factura</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 700px; margin: 30px auto; padding: 0 16px; }
+        h1 { font-size: 22px; }
+        h2 { font-size: 16px; margin-top: 28px; }
+        .volver { display: inline-block; margin-bottom: 20px; }
+        .aviso { background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin: 12px 0; }
+        label { display: block; font-size: 13px; color: #555; margin-top: 12px; }
+        input[type=text], input[type=number], input[type=date] {
+            width: 100%; padding: 8px; font-size: 15px; border: 1px solid #ccc; border-radius: 4px;
+            box-sizing: border-box; margin-top: 2px; font-family: Arial, sans-serif;
+        }
+        .item { border: 1px solid #eee; border-radius: 6px; padding: 10px 12px; margin-top: 10px; }
+        .item-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 10px; }
+        .item-grid label { margin-top: 0; }
+        .vacio { color: #777; font-size: 14px; }
+        button { background: #FF9900; border: none; padding: 12px 24px; font-size: 16px; border-radius: 6px; margin: 24px 0; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <a class="volver" href="/facturas">&larr; Volver a facturas</a>
+    <h1>Editar factura #{{ factura_id }}</h1>
+    <p class="aviso">
+        Corrige aqui cualquier dato que Textract haya leido mal a partir de la imagen original.
+        Deja un campo vacio si no puedes confirmar el valor correcto -- se guarda como "no detectado",
+        nunca como cero, para no reemplazar un error por otro.
+    </p>
+    <form method="POST">
+        <label>Proveedor
+            <input type="text" name="proveedor_nombre" value="{{ factura.proveedor_nombre or '' }}">
+        </label>
+        <label>NIT
+            <input type="text" name="nit" value="{{ factura.nit or '' }}">
+        </label>
+        <label>Fecha de factura
+            <input type="date" name="fecha_factura" value="{{ factura.fecha_factura or '' }}">
+        </label>
+        <label>Total
+            <input type="number" step="0.01" name="total" value="{{ factura.total if factura.total is not none else '' }}">
+        </label>
+        <label>Impuesto
+            <input type="number" step="0.01" name="impuesto" value="{{ factura.impuesto if factura.impuesto is not none else '' }}">
+        </label>
+
+        <h2>Items</h2>
+        {% if not items %}
+        <p class="vacio">Esta factura no tiene items registrados.</p>
+        {% endif %}
+        {% for item in items %}
+        <div class="item">
+            <input type="hidden" name="item_id" value="{{ item.item_id }}">
+            <div class="item-grid">
+                <label>Descripcion
+                    <input type="text" name="descripcion_{{ item.item_id }}" value="{{ item.descripcion or '' }}">
+                </label>
+                <label>Cantidad
+                    <input type="number" step="0.01" name="cantidad_{{ item.item_id }}" value="{{ item.cantidad if item.cantidad is not none else '' }}">
+                </label>
+                <label>Precio unitario
+                    <input type="number" step="0.01" name="precio_unitario_{{ item.item_id }}" value="{{ item.precio_unitario if item.precio_unitario is not none else '' }}">
+                </label>
+                <label>Subtotal
+                    <input type="number" step="0.01" name="subtotal_{{ item.item_id }}" value="{{ item.subtotal if item.subtotal is not none else '' }}">
+                </label>
+            </div>
+        </div>
+        {% endfor %}
+
+        <button type="submit">Guardar cambios</button>
+    </form>
 </body>
 </html>
 """
@@ -322,11 +462,11 @@ def ver_facturas():
         # el dato de todas las facturas ya procesadas estaba disponible,
         # solo no se estaba leyendo ni mostrando.
         filas_factura = conexion.run(
-            "SELECT factura_id, proveedor_nombre, nit, total, impuesto, fecha_procesado, s3_key FROM factura ORDER BY fecha_procesado DESC"
+            "SELECT factura_id, proveedor_nombre, nit, fecha_factura, total, impuesto, fecha_procesado, s3_key, editado_manualmente FROM factura ORDER BY fecha_procesado DESC"
         )
         facturas = []
         for fila in filas_factura:
-            factura_id, proveedor, nit, total, impuesto, fecha_procesado, s3_key = fila
+            factura_id, proveedor, nit, fecha_factura, total, impuesto, fecha_procesado, s3_key, editado_manualmente = fila
             filas_item = conexion.run(
                 "SELECT descripcion, cantidad, precio_unitario, subtotal FROM item_factura WHERE factura_id = :fid",
                 fid=factura_id
@@ -351,16 +491,120 @@ def ver_facturas():
                     ExpiresIn=3600
                 )
             facturas.append({
+                'factura_id': factura_id,
                 'proveedor_nombre': proveedor,
                 'nit': nit,
+                'fecha_factura': fecha_factura,
                 'total': total,
                 'impuesto': impuesto,
                 'fecha_procesado': fecha_procesado,
+                'editado_manualmente': editado_manualmente,
                 'lineas': lineas,
                 'imagen_url': imagen_url,
                 'validacion': validar_total_factura(total, impuesto, lineas)
             })
         return render_template_string(PANEL_HTML, facturas=facturas)
+    finally:
+        conexion.close()
+
+
+# Formulario de edicion manual de una factura -- punto 1 de la lista de
+# mejoras del 2026-09-02: permite corregir a mano un dato que Textract leyo
+# mal (o que nunca detecto), en vez de dejarlo atrapado como estaba antes,
+# solo visible en logs de CloudWatch o en el JSON crudo.
+#
+# GET: muestra el formulario precargado con lo que hay guardado ahora mismo.
+# POST: guarda los cambios y marca la factura como editada_manualmente, para
+# poder distinguir en /facturas un dato que viene de Textract de uno
+# corregido a mano -- misma idea de trazabilidad que ya usa el resto del
+# proyecto (NULL vs. 0, avisos en vez de silencio).
+#
+# Deliberadamente NO agrega ni quita filas de items en esta primera
+# version -- ver el comentario de EDITAR_FACTURA_HTML.
+@app.route('/facturas/<int:factura_id>/editar', methods=['GET', 'POST'])
+def editar_factura(factura_id):
+    conexion = pg8000.native.Connection(
+        user=DB_USER, password=DB_PASSWORD,
+        host=DB_HOST, port=DB_PORT, database=DB_NAME
+    )
+    try:
+        if request.method == 'POST':
+            conexion.run(
+                """
+                UPDATE factura
+                SET proveedor_nombre = :proveedor_nombre,
+                    nit = :nit,
+                    fecha_factura = :fecha_factura,
+                    total = :total,
+                    impuesto = :impuesto,
+                    editado_manualmente = TRUE,
+                    fecha_ultima_edicion = NOW()
+                WHERE factura_id = :factura_id
+                """,
+                proveedor_nombre=campo_texto_o_none(request.form.get('proveedor_nombre')),
+                nit=campo_texto_o_none(request.form.get('nit')),
+                fecha_factura=campo_fecha_o_none(request.form.get('fecha_factura')),
+                total=campo_numerico_o_none(request.form.get('total')),
+                impuesto=campo_numerico_o_none(request.form.get('impuesto')),
+                factura_id=factura_id
+            )
+
+            # El WHERE incluye factura_id ademas de item_id -- no hace falta
+            # para que esto funcione bien (item_id ya es unico por si solo),
+            # pero evita que un item_id manipulado a mano en el formulario
+            # (o repetido por error) pueda tocar una fila de otra factura.
+            for item_id in request.form.getlist('item_id'):
+                conexion.run(
+                    """
+                    UPDATE item_factura
+                    SET descripcion = :descripcion,
+                        cantidad = :cantidad,
+                        precio_unitario = :precio_unitario,
+                        subtotal = :subtotal
+                    WHERE item_id = :item_id AND factura_id = :factura_id
+                    """,
+                    descripcion=campo_texto_o_none(request.form.get(f'descripcion_{item_id}')),
+                    cantidad=campo_numerico_o_none(request.form.get(f'cantidad_{item_id}')),
+                    precio_unitario=campo_numerico_o_none(request.form.get(f'precio_unitario_{item_id}')),
+                    subtotal=campo_numerico_o_none(request.form.get(f'subtotal_{item_id}')),
+                    item_id=int(item_id),
+                    factura_id=factura_id
+                )
+
+            return redirect(url_for('ver_facturas'))
+
+        fila = conexion.run(
+            "SELECT proveedor_nombre, nit, fecha_factura, total, impuesto FROM factura WHERE factura_id = :fid",
+            fid=factura_id
+        )
+        if not fila:
+            return 'Factura no encontrada', 404
+
+        proveedor_nombre, nit, fecha_factura, total, impuesto = fila[0]
+        factura = {
+            'proveedor_nombre': proveedor_nombre,
+            'nit': nit,
+            # fecha_factura llega de RDS como un objeto date de Python;
+            # se convierte a texto ISO ('AAAA-MM-DD') porque asi es como
+            # el input type="date" del formulario espera su atributo value.
+            'fecha_factura': fecha_factura.isoformat() if fecha_factura else None,
+            'total': total,
+            'impuesto': impuesto
+        }
+
+        filas_item = conexion.run(
+            "SELECT item_id, descripcion, cantidad, precio_unitario, subtotal FROM item_factura WHERE factura_id = :fid ORDER BY item_id",
+            fid=factura_id
+        )
+        items = [
+            {
+                'item_id': i[0], 'descripcion': i[1], 'cantidad': i[2],
+                'precio_unitario': i[3], 'subtotal': i[4]
+            }
+            for i in filas_item
+        ]
+
+        return render_template_string(EDITAR_FACTURA_HTML, factura=factura, items=items, factura_id=factura_id)
     finally:
         conexion.close()
 
