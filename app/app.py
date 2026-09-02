@@ -168,16 +168,19 @@ TWILIO_AUTH_TOKEN = ssm.get_parameter(
 # boto3 -- se reutiliza en cada peticion al webhook de WhatsApp.
 validador_twilio = RequestValidator(TWILIO_AUTH_TOKEN)
 
-# --- Barra de navegacion compartida (punto 3 de las mejoras pedidas el
-# 2026-09-02: "consolidar la navegacion... en un dashboard unico").
+# --- Dashboard compartido (punto 3 de las mejoras pedidas el 2026-09-02:
+# "consolidar la navegacion... en un dashboard unico"; rediseño visual
+# agregado el mismo dia porque la barra de pestañas sola, sobre el CSS
+# minimo que ya tenia cada pagina, seguia viendose "basica" -- ver seccion
+# 5.39 de la bitacora).
 #
-# Opcion elegida (de las evaluadas en la bitacora): pestañas sobre las
-# paginas existentes, NO una pagina unica real con JS. Cada ruta sigue
-# siendo su propio endpoint de Flask que renderiza su propia plantilla --
-# lo unico nuevo es que las 5 plantillas comparten esta misma barra, con
-# la pestaña de la pagina actual resaltada, en vez de los enlaces de
-# "volver" sueltos y distintos que tenia cada una antes. Bajo riesgo:
-# no toca la logica de ningun formulario ni ruta existente.
+# Sigue siendo la misma decision de arquitectura que el punto 3 original:
+# pestañas sobre las paginas existentes, NO una pagina unica real con JS.
+# Cada ruta sigue siendo su propio endpoint de Flask que renderiza su
+# propia plantilla -- lo que cambia con el rediseño es que las 6
+# plantillas (las 5 rutas del dashboard mas /facturas/<id>/editar) ahora
+# comparten Tailwind (via CDN, mismo patron que ya se usaba con Chart.js
+# -- sin build, sin npm) en vez de CSS escrito a mano por pagina.
 #
 # No se resuelve con un include de Jinja (no hay un DictLoader de
 # plantillas, son strings de Python) -- en vez de eso, esta funcion arma
@@ -191,23 +194,35 @@ PESTANAS_DASHBOARD = [
     ('/asistente', 'Asistente'),
 ]
 
-BARRA_NAV_CSS = """
-        .barra-nav-dashboard { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 2px solid #eee; margin-bottom: 20px; }
-        .barra-nav-dashboard a { padding: 8px 14px; font-size: 14px; color: #555; text-decoration: none; border-radius: 6px 6px 0 0; }
-        .barra-nav-dashboard a:hover { background: #f5f5f5; }
-        .barra-nav-dashboard a.activa { color: #222; font-weight: bold; background: #FFF3E0; border-bottom: 2px solid #FF9900; margin-bottom: -2px; }
-    """
+# Se inserta identico en el <head> de las 6 plantillas -- concatenado con
+# Python (no hay Jinja include), igual que se hacia antes con
+# BARRA_NAV_CSS. Tailwind CDN observa el DOM y compila las clases que
+# encuentra (incluidas las que un script agrega despues de cargar, como
+# el className de los mensajes del chat en ASISTENTE_HTML), asi que no
+# hace falta ningun paso de build.
+CABECERA_TAILWIND = '<script src="https://cdn.tailwindcss.com"></script>'
 
 
 def generar_barra_nav(ruta_activa):
-    """Arma el HTML de la barra de pestañas, marcando como activa la
+    """Arma el HTML de la barra de navegacion, marcando como activa la
     pestaña de `ruta_activa`. Se resuelve en Python (no hay estado
     dinamico que justifique hacerlo en Jinja)."""
     enlaces = []
     for ruta, etiqueta in PESTANAS_DASHBOARD:
-        clase = ' class="activa"' if ruta == ruta_activa else ''
-        enlaces.append(f'<a href="{ruta}"{clase}>{etiqueta}</a>')
-    return '<nav class="barra-nav-dashboard">' + ''.join(enlaces) + '</nav>'
+        if ruta == ruta_activa:
+            clase = 'bg-orange-100 text-orange-900'
+        else:
+            clase = 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+        enlaces.append(
+            f'<a href="{ruta}" class="rounded-full px-3 py-1.5 text-sm font-medium {clase}">{etiqueta}</a>'
+        )
+    return (
+        '<nav class="border-b border-gray-200 bg-white">'
+        '<div class="mx-auto flex max-w-5xl flex-wrap items-center gap-1 px-4 py-3">'
+        '<span class="mr-3 text-sm font-bold tracking-tight text-gray-800">Facturas</span>'
+        + ''.join(enlaces) +
+        '</div></nav>'
+    )
 
 
 PAGINA_HTML = """
@@ -217,22 +232,23 @@ PAGINA_HTML = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Digitalizar Factura</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 420px; margin: 40px auto; padding: 0 16px; }
-        h1 { font-size: 22px; }
-        input[type=file] { display: block; margin: 20px 0; }
-        button { background: #FF9900; border: none; padding: 12px 20px; font-size: 16px; border-radius: 6px; }
-        #estado { margin-top: 16px; font-weight: bold; }
-        """ + BARRA_NAV_CSS + """
-    </style>
+    """ + CABECERA_TAILWIND + """
 </head>
-<body>
+<body class="min-h-screen bg-gray-50 font-sans text-gray-900">
     {{ barra_nav|safe }}
-    <h1>Digitalizar factura</h1>
-    <p>Toma una foto de tu factura o recibo:</p>
-    <input type="file" id="archivo" accept="image/*,application/pdf" capture="environment">
-    <button onclick="subirFactura()">Subir factura</button>
-    <div id="estado"></div>
+    <main class="mx-auto max-w-md px-4 py-10">
+        <div class="rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
+            <h1 class="text-xl font-bold text-gray-900">Digitalizar factura</h1>
+            <p class="mt-1 text-sm text-gray-500">Toma una foto de tu factura o recibo:</p>
+            <input type="file" id="archivo" accept="image/*,application/pdf" capture="environment"
+                class="mt-4 block w-full text-sm text-gray-700 file:mr-4 file:rounded-md file:border-0 file:bg-gray-100 file:px-4 file:py-2 file:text-sm file:font-medium file:text-gray-700 hover:file:bg-gray-200">
+            <button onclick="subirFactura()"
+                class="mt-5 w-full rounded-md bg-orange-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-orange-600">
+                Subir factura
+            </button>
+            <div id="estado" class="mt-4 text-sm font-medium text-gray-700"></div>
+        </div>
+    </main>
     <script>
         // Comprime y redimensiona una foto antes de subirla, usando un
         // <canvas> del navegador. Esto SOLO funciona con imagenes de verdad
@@ -319,88 +335,78 @@ PANEL_HTML = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Facturas procesadas</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 700px; margin: 30px auto; padding: 0 16px; }
-        h1 { font-size: 22px; }
-        .factura { border: 1px solid #ddd; border-radius: 8px; padding: 14px; margin-bottom: 16px; }
-        .factura h3 { margin: 0 0 6px 0; }
-        .factura .total { color: #FF9900; font-weight: bold; font-size: 18px; }
-        .factura .impuesto { color: #555; font-size: 14px; margin-top: -4px; }
-        .factura .nit { color: #777; font-size: 13px; margin: -4px 0 6px 0; }
-        .factura .alerta-total { color: #B00020; font-size: 13px; background: #FCE8E8; border: 1px solid #F3C6C6; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
-        .factura .info-total { color: #444; font-size: 13px; background: #F0F0F0; border: 1px solid #DDD; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
-        .factura .editado { color: #666; font-size: 12px; font-weight: normal; background: #EEE; border-radius: 4px; padding: 2px 6px; margin-left: 6px; }
-        .factura .editar { display: inline-block; margin-top: 8px; font-size: 13px; }
-        .factura .dato-extra { color: #666; font-size: 13px; margin: 2px 0; }
-        .factura .comprador { border-left: 3px solid #eee; padding-left: 10px; margin-top: 8px; }
-        .factura .comprador-titulo { color: #999; font-size: 11px; text-transform: uppercase; margin: 0 0 2px 0; }
-        .factura table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
-        .factura th, .factura td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #eee; }
-        .vacio { color: #777; }
-        """ + BARRA_NAV_CSS + """
-    </style>
+    """ + CABECERA_TAILWIND + """
 </head>
-<body>
+<body class="min-h-screen bg-gray-50 font-sans text-gray-900">
     {{ barra_nav|safe }}
-    <h1>Facturas procesadas ({{ facturas|length }})</h1>
-    {% if not facturas %}
-        <p class="vacio">Todavia no hay facturas procesadas.</p>
-    {% endif %}
-    {% for factura in facturas %}
-    <div class="factura">
-        <h3>{{ factura.proveedor_nombre or 'Proveedor no detectado' }}{% if factura.editado_manualmente %}<span class="editado">editado a mano</span>{% endif %}</h3>
-        {% if factura.nit %}
-        <p class="nit">NIT: {{ factura.nit }}</p>
+    <main class="mx-auto max-w-3xl px-4 py-8">
+        <h1 class="text-xl font-bold text-gray-900">Facturas procesadas ({{ facturas|length }})</h1>
+        {% if not facturas %}
+            <p class="mt-4 text-sm text-gray-500">Todavia no hay facturas procesadas.</p>
         {% endif %}
-        {% if factura.telefono_proveedor %}
-        <p class="dato-extra">Tel. proveedor: {{ factura.telefono_proveedor }}</p>
-        {% endif %}
-        {% if factura.direccion_proveedor %}
-        <p class="dato-extra">Dir. proveedor: {{ factura.direccion_proveedor }}</p>
-        {% endif %}
-        {% if factura.numero_factura %}
-        <p class="dato-extra">No. factura: {{ factura.numero_factura }}</p>
-        {% endif %}
-        <p>Procesada: {{ factura.fecha_procesado }}</p>
-        <p>Fecha de factura: {% if factura.fecha_factura %}{{ factura.fecha_factura }}{% else %}no detectada{% endif %}</p>
-        <p class="total">Total: {% if factura.total is not none %}${{ factura.total | cop }}{% else %}sin total detectado{% endif %}</p>
-        {% if factura.impuesto is not none %}
-        <p class="impuesto">Impuesto: ${{ factura.impuesto | cop }}</p>
-        {% endif %}
-        {% if factura.comprador_nombre or factura.telefono_comprador or factura.direccion_comprador %}
-        <div class="comprador">
-            <p class="comprador-titulo">Vendido a</p>
-            {% if factura.comprador_nombre %}<p class="dato-extra">{{ factura.comprador_nombre }}</p>{% endif %}
-            {% if factura.telefono_comprador %}<p class="dato-extra">Tel: {{ factura.telefono_comprador }}</p>{% endif %}
-            {% if factura.direccion_comprador %}<p class="dato-extra">{{ factura.direccion_comprador }}</p>{% endif %}
+        <div class="mt-5 space-y-4">
+        {% for factura in facturas %}
+        <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+            <h3 class="flex flex-wrap items-center gap-2 text-base font-semibold text-gray-900">
+                {{ factura.proveedor_nombre or 'Proveedor no detectado' }}
+                {% if factura.editado_manualmente %}<span class="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">editado a mano</span>{% endif %}
+            </h3>
+            {% if factura.nit %}
+            <p class="text-xs text-gray-500">NIT: {{ factura.nit }}</p>
+            {% endif %}
+            {% if factura.telefono_proveedor %}
+            <p class="mt-1 text-sm text-gray-600">Tel. proveedor: {{ factura.telefono_proveedor }}</p>
+            {% endif %}
+            {% if factura.direccion_proveedor %}
+            <p class="mt-1 text-sm text-gray-600">Dir. proveedor: {{ factura.direccion_proveedor }}</p>
+            {% endif %}
+            {% if factura.numero_factura %}
+            <p class="mt-1 text-sm text-gray-600">No. factura: {{ factura.numero_factura }}</p>
+            {% endif %}
+            <p class="mt-2 text-sm text-gray-600">Procesada: {{ factura.fecha_procesado }}</p>
+            <p class="text-sm text-gray-600">Fecha de factura: {% if factura.fecha_factura %}{{ factura.fecha_factura }}{% else %}no detectada{% endif %}</p>
+            <p class="mt-2 text-lg font-bold text-orange-600">Total: {% if factura.total is not none %}${{ factura.total | cop }}{% else %}sin total detectado{% endif %}</p>
+            {% if factura.impuesto is not none %}
+            <p class="text-sm text-gray-600">Impuesto: ${{ factura.impuesto | cop }}</p>
+            {% endif %}
+            {% if factura.comprador_nombre or factura.telefono_comprador or factura.direccion_comprador %}
+            <div class="mt-3 border-l-2 border-gray-200 pl-3">
+                <p class="text-xs font-medium uppercase tracking-wide text-gray-400">Vendido a</p>
+                {% if factura.comprador_nombre %}<p class="text-sm text-gray-600">{{ factura.comprador_nombre }}</p>{% endif %}
+                {% if factura.telefono_comprador %}<p class="text-sm text-gray-600">Tel: {{ factura.telefono_comprador }}</p>{% endif %}
+                {% if factura.direccion_comprador %}<p class="text-sm text-gray-600">{{ factura.direccion_comprador }}</p>{% endif %}
+            </div>
+            {% endif %}
+            {% if factura.validacion.estado == 'no_cuadra' %}
+            <p class="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                &#9888; El total no cuadra con la suma de los items (${{ factura.validacion.suma_subtotales | cop }}){% if factura.impuesto is not none %} ni sumandole el impuesto{% endif %} -- revisar la imagen original.
+            </p>
+            {% elif factura.validacion.estado == 'sin_impuesto' %}
+            <p class="mt-3 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-600">
+                El total parece no incluir el impuesto por encima de la suma de items (${{ factura.validacion.suma_subtotales | cop }}).
+            </p>
+            {% endif %}
+            {% if factura.imagen_url %}
+            <p class="mt-3 text-sm"><a href="{{ factura.imagen_url }}" target="_blank" rel="noopener" class="font-medium text-blue-600 hover:underline">Ver imagen original de la factura</a></p>
+            {% endif %}
+            <p class="mt-1 text-sm"><a href="/facturas/{{ factura.factura_id }}/editar" class="font-medium text-blue-600 hover:underline">Editar esta factura &rarr;</a></p>
+            <table class="mt-3 w-full text-sm">
+                <tr class="border-b border-gray-200 text-left text-xs uppercase tracking-wide text-gray-400">
+                    <th class="py-1.5 pr-2 font-medium">Descripcion</th><th class="py-1.5 pr-2 font-medium">Cant.</th><th class="py-1.5 pr-2 font-medium">Precio</th><th class="py-1.5 font-medium">Subtotal</th>
+                </tr>
+                {% for item in factura.lineas %}
+                <tr class="border-b border-gray-100 text-gray-700">
+                    <td class="py-1.5 pr-2">{{ item.descripcion or '-' }}</td>
+                    <td class="py-1.5 pr-2">{{ item.cantidad if item.cantidad is not none else '-' }}</td>
+                    <td class="py-1.5 pr-2">{% if item.precio_unitario is not none %}${{ item.precio_unitario | cop }}{% else %}-{% endif %}</td>
+                    <td class="py-1.5">{% if item.subtotal is not none %}${{ item.subtotal | cop }}{% else %}-{% endif %}</td>
+                </tr>
+                {% endfor %}
+            </table>
         </div>
-        {% endif %}
-        {% if factura.validacion.estado == 'no_cuadra' %}
-        <p class="alerta-total">
-            &#9888; El total no cuadra con la suma de los items (${{ factura.validacion.suma_subtotales | cop }}){% if factura.impuesto is not none %} ni sumandole el impuesto{% endif %} -- revisar la imagen original.
-        </p>
-        {% elif factura.validacion.estado == 'sin_impuesto' %}
-        <p class="info-total">
-            El total parece no incluir el impuesto por encima de la suma de items (${{ factura.validacion.suma_subtotales | cop }}).
-        </p>
-        {% endif %}
-        {% if factura.imagen_url %}
-        <p><a href="{{ factura.imagen_url }}" target="_blank" rel="noopener">Ver imagen original de la factura</a></p>
-        {% endif %}
-        <p class="editar"><a href="/facturas/{{ factura.factura_id }}/editar">Editar esta factura &rarr;</a></p>
-        <table>
-            <tr><th>Descripcion</th><th>Cant.</th><th>Precio</th><th>Subtotal</th></tr>
-            {% for item in factura.lineas %}
-            <tr>
-                <td>{{ item.descripcion or '-' }}</td>
-                <td>{{ item.cantidad if item.cantidad is not none else '-' }}</td>
-                <td>{% if item.precio_unitario is not none %}${{ item.precio_unitario | cop }}{% else %}-{% endif %}</td>
-                <td>{% if item.subtotal is not none %}${{ item.subtotal | cop }}{% else %}-{% endif %}</td>
-            </tr>
-            {% endfor %}
-        </table>
-    </div>
-    {% endfor %}
+        {% endfor %}
+        </div>
+    </main>
 </body>
 </html>
 """
@@ -419,98 +425,114 @@ EDITAR_FACTURA_HTML = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Editar factura</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 700px; margin: 30px auto; padding: 0 16px; }
-        h1 { font-size: 22px; }
-        h2 { font-size: 16px; margin-top: 28px; }
-        .volver { display: inline-block; margin-bottom: 20px; }
-        .aviso { background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin: 12px 0; }
-        label { display: block; font-size: 13px; color: #555; margin-top: 12px; }
-        input[type=text], input[type=number], input[type=date] {
-            width: 100%; padding: 8px; font-size: 15px; border: 1px solid #ccc; border-radius: 4px;
-            box-sizing: border-box; margin-top: 2px; font-family: Arial, sans-serif;
-        }
-        .item { border: 1px solid #eee; border-radius: 6px; padding: 10px 12px; margin-top: 10px; }
-        .item-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 10px; }
-        .item-grid label { margin-top: 0; }
-        .vacio { color: #777; font-size: 14px; }
-        button { background: #FF9900; border: none; padding: 12px 24px; font-size: 16px; border-radius: 6px; margin: 24px 0; cursor: pointer; }
-        """ + BARRA_NAV_CSS + """
-    </style>
+    """ + CABECERA_TAILWIND + """
 </head>
-<body>
+<body class="min-h-screen bg-gray-50 font-sans text-gray-900">
     {{ barra_nav|safe }}
-    <h1>Editar factura #{{ factura_id }}</h1>
-    <p class="aviso">
-        Corrige aqui cualquier dato que Textract haya leido mal a partir de la imagen original.
-        Deja un campo vacio si no puedes confirmar el valor correcto -- se guarda como "no detectado",
-        nunca como cero, para no reemplazar un error por otro.
-    </p>
-    <form method="POST">
-        <label>Numero de factura
-            <input type="text" name="numero_factura" value="{{ factura.numero_factura or '' }}">
-        </label>
-        <label>Fecha de factura
-            <input type="date" name="fecha_factura" value="{{ factura.fecha_factura or '' }}">
-        </label>
-        <label>Total
-            <input type="number" step="0.01" name="total" value="{{ factura.total if factura.total is not none else '' }}">
-        </label>
-        <label>Impuesto
-            <input type="number" step="0.01" name="impuesto" value="{{ factura.impuesto if factura.impuesto is not none else '' }}">
-        </label>
-
-        <h2>Proveedor</h2>
-        <label>Nombre
-            <input type="text" name="proveedor_nombre" value="{{ factura.proveedor_nombre or '' }}">
-        </label>
-        <label>NIT
-            <input type="text" name="nit" value="{{ factura.nit or '' }}">
-        </label>
-        <label>Telefono
-            <input type="text" name="telefono_proveedor" value="{{ factura.telefono_proveedor or '' }}">
-        </label>
-        <label>Direccion
-            <input type="text" name="direccion_proveedor" value="{{ factura.direccion_proveedor or '' }}">
-        </label>
-
-        <h2>Comprador</h2>
-        <label>Nombre
-            <input type="text" name="comprador_nombre" value="{{ factura.comprador_nombre or '' }}">
-        </label>
-        <label>Telefono
-            <input type="text" name="telefono_comprador" value="{{ factura.telefono_comprador or '' }}">
-        </label>
-        <label>Direccion
-            <input type="text" name="direccion_comprador" value="{{ factura.direccion_comprador or '' }}">
-        </label>
-
-        <h2>Items</h2>
-        {% if not items %}
-        <p class="vacio">Esta factura no tiene items registrados.</p>
-        {% endif %}
-        {% for item in items %}
-        <div class="item">
-            <input type="hidden" name="item_id" value="{{ item.item_id }}">
-            <div class="item-grid">
-                <label>Descripcion
-                    <input type="text" name="descripcion_{{ item.item_id }}" value="{{ item.descripcion or '' }}">
-                </label>
-                <label>Cantidad
-                    <input type="number" step="0.01" name="cantidad_{{ item.item_id }}" value="{{ item.cantidad if item.cantidad is not none else '' }}">
-                </label>
-                <label>Precio unitario
-                    <input type="number" step="0.01" name="precio_unitario_{{ item.item_id }}" value="{{ item.precio_unitario if item.precio_unitario is not none else '' }}">
-                </label>
-                <label>Subtotal
-                    <input type="number" step="0.01" name="subtotal_{{ item.item_id }}" value="{{ item.subtotal if item.subtotal is not none else '' }}">
-                </label>
+    <main class="mx-auto max-w-3xl px-4 py-8">
+        <h1 class="text-xl font-bold text-gray-900">Editar factura #{{ factura_id }}</h1>
+        <p class="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+            Corrige aqui cualquier dato que Textract haya leido mal a partir de la imagen original.
+            Deja un campo vacio si no puedes confirmar el valor correcto -- se guarda como "no detectado",
+            nunca como cero, para no reemplazar un error por otro.
+        </p>
+        <form method="POST" class="mt-5 space-y-5">
+            <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+                <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <label class="block text-sm font-medium text-gray-600">Numero de factura
+                        <input type="text" name="numero_factura" value="{{ factura.numero_factura or '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                    <label class="block text-sm font-medium text-gray-600">Fecha de factura
+                        <input type="date" name="fecha_factura" value="{{ factura.fecha_factura or '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                    <label class="block text-sm font-medium text-gray-600">Total
+                        <input type="number" step="0.01" name="total" value="{{ factura.total if factura.total is not none else '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                    <label class="block text-sm font-medium text-gray-600">Impuesto
+                        <input type="number" step="0.01" name="impuesto" value="{{ factura.impuesto if factura.impuesto is not none else '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                </div>
             </div>
-        </div>
-        {% endfor %}
 
-        <button type="submit">Guardar cambios</button>
-    </form>
+            <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+                <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">Proveedor</h2>
+                <div class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <label class="block text-sm font-medium text-gray-600">Nombre
+                        <input type="text" name="proveedor_nombre" value="{{ factura.proveedor_nombre or '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                    <label class="block text-sm font-medium text-gray-600">NIT
+                        <input type="text" name="nit" value="{{ factura.nit or '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                    <label class="block text-sm font-medium text-gray-600">Telefono
+                        <input type="text" name="telefono_proveedor" value="{{ factura.telefono_proveedor or '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                    <label class="block text-sm font-medium text-gray-600">Direccion
+                        <input type="text" name="direccion_proveedor" value="{{ factura.direccion_proveedor or '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                </div>
+            </div>
+
+            <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+                <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">Comprador</h2>
+                <div class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <label class="block text-sm font-medium text-gray-600">Nombre
+                        <input type="text" name="comprador_nombre" value="{{ factura.comprador_nombre or '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                    <label class="block text-sm font-medium text-gray-600">Telefono
+                        <input type="text" name="telefono_comprador" value="{{ factura.telefono_comprador or '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                    <label class="block text-sm font-medium text-gray-600 sm:col-span-2">Direccion
+                        <input type="text" name="direccion_comprador" value="{{ factura.direccion_comprador or '' }}"
+                            class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    </label>
+                </div>
+            </div>
+
+            <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+                <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">Items</h2>
+                {% if not items %}
+                <p class="mt-2 text-sm text-gray-500">Esta factura no tiene items registrados.</p>
+                {% endif %}
+                <div class="mt-3 space-y-3">
+                {% for item in items %}
+                <div class="rounded-lg border border-gray-200 p-3">
+                    <input type="hidden" name="item_id" value="{{ item.item_id }}">
+                    <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                        <label class="block text-xs font-medium text-gray-600 sm:col-span-2">Descripcion
+                            <input type="text" name="descripcion_{{ item.item_id }}" value="{{ item.descripcion or '' }}"
+                                class="mt-1 block w-full rounded-md border border-gray-300 px-2.5 py-1.5 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                        </label>
+                        <label class="block text-xs font-medium text-gray-600">Cantidad
+                            <input type="number" step="0.01" name="cantidad_{{ item.item_id }}" value="{{ item.cantidad if item.cantidad is not none else '' }}"
+                                class="mt-1 block w-full rounded-md border border-gray-300 px-2.5 py-1.5 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                        </label>
+                        <label class="block text-xs font-medium text-gray-600">Precio unitario
+                            <input type="number" step="0.01" name="precio_unitario_{{ item.item_id }}" value="{{ item.precio_unitario if item.precio_unitario is not none else '' }}"
+                                class="mt-1 block w-full rounded-md border border-gray-300 px-2.5 py-1.5 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                        </label>
+                        <label class="block text-xs font-medium text-gray-600">Subtotal
+                            <input type="number" step="0.01" name="subtotal_{{ item.item_id }}" value="{{ item.subtotal if item.subtotal is not none else '' }}"
+                                class="mt-1 block w-full rounded-md border border-gray-300 px-2.5 py-1.5 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                        </label>
+                    </div>
+                </div>
+                {% endfor %}
+                </div>
+            </div>
+
+            <button type="submit" class="rounded-md bg-orange-500 px-5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-orange-600">Guardar cambios</button>
+        </form>
+    </main>
 </body>
 </html>
 """
@@ -1016,104 +1038,108 @@ PANEL_GESTION_HTML = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Panel de gestion</title>
+    """ + CABECERA_TAILWIND + """
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; color: #222; }
-        h1 { font-size: 22px; }
-        h2 { font-size: 17px; margin-top: 32px; }
-        .volver { display: inline-block; margin-bottom: 16px; color: #0066cc; }
-        .tarjetas { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
-        .tarjeta { background: #f7f7f7; border: 1px solid #ddd; border-radius: 8px; padding: 14px 18px; min-width: 150px; flex: 1; }
-        .tarjeta .etiqueta { font-size: 12px; color: #666; text-transform: uppercase; }
-        .tarjeta .valor { font-size: 22px; font-weight: bold; margin-top: 4px; }
-        .valor.positivo { color: #1a7a1a; }
-        .valor.negativo { color: #c0392b; }
-        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 14px; }
-        th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
-        .vacio { color: #777; font-size: 14px; }
-        .aviso { background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: 10px 14px; font-size: 14px; margin-top: 8px; }
-        """ + BARRA_NAV_CSS + """
-    </style>
 </head>
-<body>
+<body class="min-h-screen bg-gray-50 font-sans text-gray-900">
     {{ barra_nav|safe }}
-    <h1>Panel de gestion</h1>
+    <main class="mx-auto max-w-5xl px-4 py-8">
+        <h1 class="text-xl font-bold text-gray-900">Panel de gestion</h1>
 
-    <div class="tarjetas">
-        <div class="tarjeta">
-            <div class="etiqueta">Gasto de hoy</div>
-            <div class="valor">${{ resumen_gasto_hoy.total_periodo | cop }}</div>
-        </div>
-        <div class="tarjeta">
-            <div class="etiqueta">Venta de hoy</div>
-            <div class="valor">
-                {% if venta_hoy is not none %}${{ venta_hoy | cop }}{% else %}Sin registrar{% endif %}
+        <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <div class="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+                <div class="text-xs font-medium uppercase tracking-wide text-gray-400">Gasto de hoy</div>
+                <div class="mt-1 text-xl font-bold text-gray-900">${{ resumen_gasto_hoy.total_periodo | cop }}</div>
+            </div>
+            <div class="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+                <div class="text-xs font-medium uppercase tracking-wide text-gray-400">Venta de hoy</div>
+                <div class="mt-1 text-xl font-bold text-gray-900">
+                    {% if venta_hoy is not none %}${{ venta_hoy | cop }}{% else %}Sin registrar{% endif %}
+                </div>
+            </div>
+            <div class="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+                <div class="text-xs font-medium uppercase tracking-wide text-gray-400">Margen aprox. (30 dias)</div>
+                <div class="mt-1 text-xl font-bold {{ 'text-green-700' if comparacion_gasto_venta.margen_aproximado >= 0 else 'text-red-600' }}">
+                    ${{ comparacion_gasto_venta.margen_aproximado | cop }}
+                </div>
+            </div>
+            <div class="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+                <div class="text-xs font-medium uppercase tracking-wide text-gray-400">Gasto vs. 30 dias anteriores</div>
+                <div class="mt-1 text-xl font-bold text-gray-900">
+                    {% if comparacion_periodos.variacion_porcentual is none %}
+                        <span class="text-base font-medium text-gray-500">Sin datos previos</span>
+                    {% else %}
+                        {{ comparacion_periodos.variacion_porcentual | cop(1) }}%
+                    {% endif %}
+                </div>
             </div>
         </div>
-        <div class="tarjeta">
-            <div class="etiqueta">Margen aprox. (30 dias)</div>
-            <div class="valor {{ 'positivo' if comparacion_gasto_venta.margen_aproximado >= 0 else 'negativo' }}">
-                ${{ comparacion_gasto_venta.margen_aproximado | cop }}
-            </div>
+
+        <h2 class="mt-8 text-sm font-semibold uppercase tracking-wide text-gray-500">Gasto vs. venta por dia (ultimos 30 dias)</h2>
+        <div class="mt-3 rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+            <canvas id="graficaGastoVenta" height="100"></canvas>
         </div>
-        <div class="tarjeta">
-            <div class="etiqueta">Gasto vs. 30 dias anteriores</div>
-            <div class="valor">
-                {% if comparacion_periodos.variacion_porcentual is none %}
-                    Sin datos previos
-                {% else %}
-                    {{ comparacion_periodos.variacion_porcentual | cop(1) }}%
-                {% endif %}
-            </div>
+
+        <h2 class="mt-8 text-sm font-semibold uppercase tracking-wide text-gray-500">Proveedores principales (ultimos 30 dias)</h2>
+        {% if top_proveedores %}
+        <div class="mt-3 overflow-x-auto rounded-xl border border-gray-200 bg-white shadow-sm">
+        <table class="w-full text-sm">
+            <tr class="border-b border-gray-200 text-left text-xs uppercase tracking-wide text-gray-400">
+                <th class="px-4 py-2 font-medium">Proveedor</th><th class="px-4 py-2 font-medium">Facturas</th><th class="px-4 py-2 font-medium">Total gastado</th>
+            </tr>
+            {% for p in top_proveedores %}
+            <tr class="border-b border-gray-100 text-gray-700 last:border-0">
+                <td class="px-4 py-2">{{ p.proveedor }}</td><td class="px-4 py-2">{{ p.cantidad_facturas }}</td><td class="px-4 py-2">${{ p.total_gastado | cop }}</td>
+            </tr>
+            {% endfor %}
+        </table>
         </div>
-    </div>
+        {% else %}
+        <p class="mt-3 text-sm text-gray-500">Todavia no hay suficientes datos.</p>
+        {% endif %}
 
-    <h2>Gasto vs. venta por dia (ultimos 30 dias)</h2>
-    <canvas id="graficaGastoVenta" height="100"></canvas>
+        <h2 class="mt-8 text-sm font-semibold uppercase tracking-wide text-gray-500">Items mas frecuentes (ultimos 30 dias)</h2>
+        {% if item_mas_frecuente %}
+        <div class="mt-3 overflow-x-auto rounded-xl border border-gray-200 bg-white shadow-sm">
+        <table class="w-full text-sm">
+            <tr class="border-b border-gray-200 text-left text-xs uppercase tracking-wide text-gray-400">
+                <th class="px-4 py-2 font-medium">Descripcion</th><th class="px-4 py-2 font-medium">Veces</th><th class="px-4 py-2 font-medium">Total gastado</th>
+            </tr>
+            {% for it in item_mas_frecuente %}
+            <tr class="border-b border-gray-100 text-gray-700 last:border-0">
+                <td class="px-4 py-2">{{ it.descripcion }}</td><td class="px-4 py-2">{{ it.veces }}</td><td class="px-4 py-2">${{ it.total_gastado | cop }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        </div>
+        {% else %}
+        <p class="mt-3 text-sm text-gray-500">Todavia no hay suficientes datos.</p>
+        {% endif %}
 
-    <h2>Proveedores principales (ultimos 30 dias)</h2>
-    {% if top_proveedores %}
-    <table>
-        <tr><th>Proveedor</th><th>Facturas</th><th>Total gastado</th></tr>
-        {% for p in top_proveedores %}
-        <tr><td>{{ p.proveedor }}</td><td>{{ p.cantidad_facturas }}</td><td>${{ p.total_gastado | cop }}</td></tr>
-        {% endfor %}
-    </table>
-    {% else %}
-    <p class="vacio">Todavia no hay suficientes datos.</p>
-    {% endif %}
+        {% if facturas_incompletas %}
+        <h2 class="mt-8 text-sm font-semibold uppercase tracking-wide text-gray-500">Facturas para revisar</h2>
+        <div class="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+            {{ facturas_incompletas|length }} factura(s) de los ultimos 30 dias quedaron con el proveedor o el total sin detectar. Puede que valga la pena revisarlas o volver a subir la foto.
+        </div>
+        <div class="mt-3 overflow-x-auto rounded-xl border border-gray-200 bg-white shadow-sm">
+        <table class="w-full text-sm">
+            <tr class="border-b border-gray-200 text-left text-xs uppercase tracking-wide text-gray-400">
+                <th class="px-4 py-2 font-medium">ID</th><th class="px-4 py-2 font-medium">Proveedor</th><th class="px-4 py-2 font-medium">Total</th><th class="px-4 py-2 font-medium">Procesada</th>
+            </tr>
+            {% for f in facturas_incompletas %}
+            <tr class="border-b border-gray-100 text-gray-700 last:border-0">
+                <td class="px-4 py-2">{{ f.factura_id }}</td>
+                <td class="px-4 py-2">{{ f.proveedor_nombre or '(sin detectar)' }}</td>
+                <td class="px-4 py-2">{% if f.total is not none %}${{ f.total | cop }}{% else %}(sin detectar){% endif %}</td>
+                <td class="px-4 py-2">{{ f.fecha_procesado }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        </div>
+        {% endif %}
 
-    <h2>Items mas frecuentes (ultimos 30 dias)</h2>
-    {% if item_mas_frecuente %}
-    <table>
-        <tr><th>Descripcion</th><th>Veces</th><th>Total gastado</th></tr>
-        {% for it in item_mas_frecuente %}
-        <tr><td>{{ it.descripcion }}</td><td>{{ it.veces }}</td><td>${{ it.total_gastado | cop }}</td></tr>
-        {% endfor %}
-    </table>
-    {% else %}
-    <p class="vacio">Todavia no hay suficientes datos.</p>
-    {% endif %}
-
-    {% if facturas_incompletas %}
-    <h2>Facturas para revisar</h2>
-    <div class="aviso">
-        {{ facturas_incompletas|length }} factura(s) de los ultimos 30 dias quedaron con el proveedor o el total sin detectar. Puede que valga la pena revisarlas o volver a subir la foto.
-    </div>
-    <table>
-        <tr><th>ID</th><th>Proveedor</th><th>Total</th><th>Procesada</th></tr>
-        {% for f in facturas_incompletas %}
-        <tr>
-            <td>{{ f.factura_id }}</td>
-            <td>{{ f.proveedor_nombre or '(sin detectar)' }}</td>
-            <td>{% if f.total is not none %}${{ f.total | cop }}{% else %}(sin detectar){% endif %}</td>
-            <td>{{ f.fecha_procesado }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-    {% endif %}
-
-    <p><a href="/registrar-venta">Registrar la venta de hoy &rarr;</a></p>
+        <p class="mt-6 text-sm"><a href="/registrar-venta" class="font-medium text-blue-600 hover:underline">Registrar la venta de hoy &rarr;</a></p>
+    </main>
 
     <script>
         // datosGrafica llega ya calculado desde Flask (una lista de 30
@@ -1226,21 +1252,29 @@ FORM_VENTA_HTML = """
 <head>
     <meta charset="UTF-8">
     <title>Registrar venta del dia</title>
-    <style>
-        """ + BARRA_NAV_CSS + """
-    </style>
+    """ + CABECERA_TAILWIND + """
 </head>
-<body>
+<body class="min-h-screen bg-gray-50 font-sans text-gray-900">
     {{ barra_nav|safe }}
-    <h1>Registrar venta del dia</h1>
-    {% if mensaje %}
-        <p><strong>{{ mensaje }}</strong></p>
-    {% endif %}
-    <form method="POST">
-        <label>Fecha: <input type="date" name="fecha" value="{{ fecha_hoy }}" required></label><br><br>
-        <label>Venta total del dia (COP): <input type="number" name="monto" step="0.01" min="0" required></label><br><br>
-        <button type="submit">Guardar</button>
-    </form>
+    <main class="mx-auto max-w-md px-4 py-10">
+        <div class="rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
+            <h1 class="text-xl font-bold text-gray-900">Registrar venta del dia</h1>
+            {% if mensaje %}
+                <p class="mt-3 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm font-medium text-gray-700">{{ mensaje }}</p>
+            {% endif %}
+            <form method="POST" class="mt-4 space-y-4">
+                <label class="block text-sm font-medium text-gray-600">Fecha
+                    <input type="date" name="fecha" value="{{ fecha_hoy }}" required
+                        class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                </label>
+                <label class="block text-sm font-medium text-gray-600">Venta total del dia (COP)
+                    <input type="number" name="monto" step="0.01" min="0" required
+                        class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                </label>
+                <button type="submit" class="w-full rounded-md bg-orange-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-orange-600">Guardar</button>
+            </form>
+        </div>
+    </main>
 </body>
 </html>
 """
@@ -1776,33 +1810,24 @@ ASISTENTE_HTML = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Asistente de negocio</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 600px; margin: 24px auto; padding: 0 16px; }
-        h1 { font-size: 20px; }
-        .volver { display: inline-block; margin-bottom: 16px; color: #0066cc; }
-        .cabecera { display: flex; justify-content: space-between; align-items: center; }
-        .nueva-conversacion { background: none; border: 1px solid #ccc; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
-        #conversacion { min-height: 200px; }
-        #conversacion p { margin: 8px 0; padding: 8px 12px; border-radius: 8px; white-space: pre-wrap; }
-        #conversacion p.usuario { background: #e8f0fe; text-align: right; }
-        #conversacion p.asistente { background: #f0f0f0; }
-        .fila-entrada { display: flex; gap: 8px; margin-top: 16px; }
-        #entrada { flex: 1; padding: 10px; font-size: 15px; }
-        button { padding: 10px 16px; background: #FF9900; border: none; border-radius: 6px; font-size: 15px; }
-        """ + BARRA_NAV_CSS + """
-    </style>
+    """ + CABECERA_TAILWIND + """
 </head>
-<body>
+<body class="min-h-screen bg-gray-50 font-sans text-gray-900">
     {{ barra_nav|safe }}
-    <div class="cabecera">
-        <h1>Preguntale a tu negocio</h1>
-        <button class="nueva-conversacion" onclick="nuevaConversacion()">Nueva conversacion</button>
-    </div>
-    <div id="conversacion"></div>
-    <div class="fila-entrada">
-        <input id="entrada" type="text" placeholder="Ej: cuanto he gastado esta semana?">
-        <button onclick="enviarPregunta()">Enviar</button>
-    </div>
+    <main class="mx-auto max-w-2xl px-4 py-8">
+        <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+            <div class="flex items-center justify-between">
+                <h1 class="text-lg font-bold text-gray-900">Preguntale a tu negocio</h1>
+                <button class="rounded-md border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50" onclick="nuevaConversacion()">Nueva conversacion</button>
+            </div>
+            <div id="conversacion" class="mt-4 min-h-[200px] space-y-1"></div>
+            <div class="mt-4 flex gap-2">
+                <input id="entrada" type="text" placeholder="Ej: cuanto he gastado esta semana?"
+                    class="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                <button class="rounded-md bg-orange-500 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-orange-600" onclick="enviarPregunta()">Enviar</button>
+            </div>
+        </div>
+    </main>
 
     <script>
         // El historial vive solo en esta pestana del navegador (se pierde
@@ -1859,7 +1884,16 @@ ASISTENTE_HTML = """
         function agregarMensaje(quien, texto) {
             const conversacion = document.getElementById('conversacion');
             const parrafo = document.createElement('p');
-            parrafo.className = quien;
+            // quien sigue siendo 'usuario' o 'asistente' (mismo valor de
+            // siempre) -- lo unico que cambia es que ahora se traduce a
+            // clases de Tailwind en vez de a un nombre de clase CSS propio.
+            // Tailwind CDN observa el DOM y compila clases agregadas en
+            // tiempo de ejecucion, asi que esto no requiere ningun paso
+            // de build adicional.
+            const clasesBase = 'my-1 max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm';
+            parrafo.className = quien === 'usuario'
+                ? clasesBase + ' ml-auto bg-blue-50 text-right text-gray-800'
+                : clasesBase + ' bg-gray-100 text-gray-800';
             parrafo.textContent = texto;
             conversacion.appendChild(parrafo);
             return parrafo;
