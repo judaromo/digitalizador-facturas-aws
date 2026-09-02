@@ -186,12 +186,18 @@ validador_twilio = RequestValidator(TWILIO_AUTH_TOKEN)
 # plantillas, son strings de Python) -- en vez de eso, esta funcion arma
 # el HTML ya resuelto en Python y cada ruta lo pasa como variable
 # (barra_nav) a render_template_string, para insertarla con {{ barra_nav|safe }}.
+# Reducido a 2 pestañas el 2026-09-02 (seccion 5.40 de la bitacora): con
+# el tablero bento-grid, "Subir factura", el resumen del panel y el
+# asistente ya viven dentro de "/" -- no son destinos aparte. "/panel" y
+# "/asistente" siguen existiendo como paginas propias (utiles para verlas
+# a pantalla completa) pero ya no son pestañas de primer nivel; se llega
+# a ellas por enlaces dentro del tablero, no por esta barra. Lo mismo
+# "/registrar-venta": la accion de registrar una venta ahora vive inline
+# en "/facturas" (ver ese modulo), y la pagina vieja se deja intacta solo
+# por compatibilidad de acceso directo.
 PESTANAS_DASHBOARD = [
-    ('/', 'Subir factura'),
+    ('/', 'Tablero'),
     ('/facturas', 'Facturas'),
-    ('/panel', 'Panel'),
-    ('/registrar-venta', 'Registrar venta'),
-    ('/asistente', 'Asistente'),
 ]
 
 # Se inserta identico en el <head> de las 6 plantillas -- concatenado con
@@ -225,31 +231,110 @@ def generar_barra_nav(ruta_activa):
     )
 
 
-PAGINA_HTML = """
+# Tablero unico (bento-grid), agregado el 2026-09-02 -- seccion 5.40 de
+# la bitacora. Antes de esto, "/" era solo la pagina de subir factura;
+# ahora es el punto de entrada real de la app, con 4 modulos visibles a
+# la vez, sin navegar: subir factura, resumen del panel (4 tarjetas +
+# grafica, SIN las tablas -- esas se quedan en "/panel" completo),
+# tarjeta de acceso a "/facturas" (que ahora tambien incluye la columna
+# de ventas registradas), y el asistente conversacional completo.
+#
+# Los datos del modulo de panel se calculan en index() reutilizando las
+# mismas funciones obtener_*() que ya usaba panel() -- ningun query
+# nuevo, ninguna logica de negocio duplicada, solo se le paso un
+# subconjunto de las mismas variables a esta plantilla.
+DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Digitalizar Factura</title>
+    <title>Tablero -- Facturas</title>
     """ + CABECERA_TAILWIND + """
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 </head>
 <body class="min-h-screen bg-gray-50 font-sans text-gray-900">
     {{ barra_nav|safe }}
-    <main class="mx-auto max-w-md px-4 py-10">
-        <div class="rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
-            <h1 class="text-xl font-bold text-gray-900">Digitalizar factura</h1>
-            <p class="mt-1 text-sm text-gray-500">Toma una foto de tu factura o recibo:</p>
-            <input type="file" id="archivo" accept="image/*,application/pdf" capture="environment"
-                class="mt-4 block w-full text-sm text-gray-700 file:mr-4 file:rounded-md file:border-0 file:bg-gray-100 file:px-4 file:py-2 file:text-sm file:font-medium file:text-gray-700 hover:file:bg-gray-200">
-            <button onclick="subirFactura()"
-                class="mt-5 w-full rounded-md bg-orange-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-orange-600">
-                Subir factura
-            </button>
-            <div id="estado" class="mt-4 text-sm font-medium text-gray-700"></div>
+    <main class="mx-auto max-w-6xl px-4 py-8">
+        <div class="grid grid-cols-1 gap-4 lg:grid-cols-3">
+
+            <!-- Modulo: subir factura -->
+            <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+                <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">Subir factura</h2>
+                <p class="mt-1 text-sm text-gray-500">Toma una foto de tu factura o recibo:</p>
+                <input type="file" id="archivo" accept="image/*,application/pdf" capture="environment"
+                    class="mt-4 block w-full text-sm text-gray-700 file:mr-4 file:rounded-md file:border-0 file:bg-gray-100 file:px-4 file:py-2 file:text-sm file:font-medium file:text-gray-700 hover:file:bg-gray-200">
+                <button onclick="subirFactura()"
+                    class="mt-4 w-full rounded-md bg-orange-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-orange-600">
+                    Subir factura
+                </button>
+                <div id="estado" class="mt-3 text-sm font-medium text-gray-700"></div>
+            </div>
+
+            <!-- Modulo: resumen del panel (version condensada de /panel) -->
+            <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+                <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">Panel de gestion</h2>
+                <div class="mt-3 grid grid-cols-2 gap-2">
+                    <div class="rounded-lg bg-gray-50 p-2.5">
+                        <div class="text-[11px] uppercase tracking-wide text-gray-400">Gasto de hoy</div>
+                        <div class="mt-0.5 text-base font-bold text-gray-900">${{ resumen_gasto_hoy.total_periodo | cop }}</div>
+                    </div>
+                    <div class="rounded-lg bg-gray-50 p-2.5">
+                        <div class="text-[11px] uppercase tracking-wide text-gray-400">Venta de hoy</div>
+                        <div class="mt-0.5 text-base font-bold text-gray-900">
+                            {% if venta_hoy is not none %}${{ venta_hoy | cop }}{% else %}Sin registrar{% endif %}
+                        </div>
+                    </div>
+                    <div class="rounded-lg bg-gray-50 p-2.5">
+                        <div class="text-[11px] uppercase tracking-wide text-gray-400">Margen aprox.</div>
+                        <div class="mt-0.5 text-base font-bold {{ 'text-green-700' if comparacion_gasto_venta.margen_aproximado >= 0 else 'text-red-600' }}">
+                            ${{ comparacion_gasto_venta.margen_aproximado | cop }}
+                        </div>
+                    </div>
+                    <div class="rounded-lg bg-gray-50 p-2.5">
+                        <div class="text-[11px] uppercase tracking-wide text-gray-400">Gasto vs. 30d</div>
+                        <div class="mt-0.5 text-base font-bold text-gray-900">
+                            {% if comparacion_periodos.variacion_porcentual is none %}
+                                <span class="text-sm font-medium text-gray-500">Sin datos</span>
+                            {% else %}
+                                {{ comparacion_periodos.variacion_porcentual | cop(1) }}%
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+                <canvas id="graficaResumenTablero" class="mt-3" height="140"></canvas>
+                <p class="mt-3 text-sm"><a href="/panel" class="font-medium text-blue-600 hover:underline">Ver panel completo &rarr;</a></p>
+            </div>
+
+            <!-- Modulo: acceso a facturas + ventas -->
+            <a href="/facturas" class="flex flex-col justify-between rounded-xl border border-gray-200 bg-white p-5 shadow-sm hover:border-orange-300 hover:shadow">
+                <div>
+                    <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">Facturas y ventas</h2>
+                    <p class="mt-2 text-3xl font-bold text-gray-900">{{ total_facturas }}</p>
+                    <p class="text-sm text-gray-500">facturas procesadas en total</p>
+                </div>
+                <p class="mt-4 text-sm font-medium text-blue-600">Ver facturas digitalizadas y ventas registradas &rarr;</p>
+            </a>
+
+            <!-- Modulo: asistente conversacional -->
+            <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm lg:col-span-3">
+                <div class="flex items-center justify-between">
+                    <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">Preguntale a tu negocio</h2>
+                    <button class="rounded-md border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50" onclick="nuevaConversacion()">Nueva conversacion</button>
+                </div>
+                <div id="conversacion" class="mt-4 min-h-[160px] space-y-1"></div>
+                <div class="mt-4 flex gap-2">
+                    <input id="entrada" type="text" placeholder="Ej: cuanto he gastado esta semana?"
+                        class="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                    <button class="rounded-md bg-orange-500 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-orange-600" onclick="enviarPregunta()">Enviar</button>
+                </div>
+            </div>
+
         </div>
     </main>
+
     <script>
+        // ---- Modulo subir factura (identico a la version anterior de "/") ----
         // Comprime y redimensiona una foto antes de subirla, usando un
         // <canvas> del navegador. Esto SOLO funciona con imagenes de verdad
         // (JPEG, PNG, etc.) -- un <img> del navegador no puede decodificar
@@ -257,9 +342,6 @@ PAGINA_HTML = """
         // onload (ni onerror, sin el manejo de abajo), y la Promise se
         // queda esperando para siempre. Por eso subirFactura() de abajo
         // nunca llama a esta funcion con un PDF -- lo sube tal cual.
-        // Se agrega tambien un manejo de error explicito (antes no existia)
-        // para el caso de un archivo de imagen corrupto o no reconocido,
-        // que antes se habria quedado colgado de la misma forma.
         function comprimirImagen(archivo) {
             return new Promise((resolve, reject) => {
                 const img = new Image();
@@ -295,9 +377,6 @@ PAGINA_HTML = """
             let archivo;
             try {
                 if (archivoOriginal.type === 'application/pdf') {
-                    // Un PDF se sube tal cual, sin pasar por comprimirImagen
-                    // -- ese paso es exclusivo de fotos y con un PDF nunca
-                    // terminaria (ver el comentario de la funcion).
                     estado.textContent = 'Preparando subida...';
                     archivo = archivoOriginal;
                 } else {
@@ -323,90 +402,271 @@ PAGINA_HTML = """
                 estado.textContent = 'Error al subir la factura.';
             }
         }
+
+        // ---- Modulo panel resumido: misma grafica de /panel, mas pequena ----
+        const datosGrafica = {{ datos_grafica | tojson }};
+        new Chart(document.getElementById('graficaResumenTablero'), {
+            type: 'line',
+            data: {
+                labels: datosGrafica.dias,
+                datasets: [
+                    { label: 'Gasto', data: datosGrafica.gasto, borderColor: '#c0392b', backgroundColor: 'rgba(192, 57, 43, 0.1)', tension: 0.2, pointRadius: 0 },
+                    { label: 'Venta', data: datosGrafica.venta, borderColor: '#1a7a1a', backgroundColor: 'rgba(26, 122, 26, 0.1)', tension: 0.2, pointRadius: 0 }
+                ]
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { labels: { boxWidth: 10, font: { size: 10 } } } },
+                scales: { y: { beginAtZero: true, ticks: { font: { size: 9 } } }, x: { ticks: { display: false } } }
+            }
+        });
+
+        // ---- Modulo asistente (identico a la version anterior de "/asistente") ----
+        let historial = [];
+        document.getElementById('entrada').addEventListener('keydown', function (evento) {
+            if (evento.key === 'Enter') enviarPregunta();
+        });
+        async function enviarPregunta() {
+            const entrada = document.getElementById('entrada');
+            const pregunta = entrada.value.trim();
+            if (!pregunta) return;
+            agregarMensaje('usuario', pregunta);
+            entrada.value = '';
+            const indicador = agregarMensaje('asistente', 'Pensando...');
+            try {
+                const respuestaHttp = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pregunta: pregunta, historial: historial })
+                });
+                const datos = await respuestaHttp.json();
+                indicador.textContent = datos.respuesta;
+                historial.push({ role: 'user', texto: pregunta });
+                historial.push({ role: 'assistant', texto: datos.respuesta });
+            } catch (error) {
+                indicador.textContent = 'Hubo un error de conexion. Intenta de nuevo.';
+            }
+        }
+        function nuevaConversacion() {
+            historial = [];
+            document.getElementById('conversacion').innerHTML = '';
+        }
+        function agregarMensaje(quien, texto) {
+            const conversacion = document.getElementById('conversacion');
+            const parrafo = document.createElement('p');
+            const clasesBase = 'my-1 max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm';
+            parrafo.className = quien === 'usuario'
+                ? clasesBase + ' ml-auto bg-blue-50 text-right text-gray-800'
+                : clasesBase + ' bg-gray-100 text-gray-800';
+            parrafo.textContent = texto;
+            conversacion.appendChild(parrafo);
+            return parrafo;
+        }
     </script>
 </body>
 </html>
 """
 
+# Rediseñada como pagina de dos columnas (seccion 5.41 de la bitacora):
+# a la izquierda, las facturas digitalizadas (ahora filtrables por fecha
+# con ?fecha=AAAA-MM-DD); a la derecha, las ventas registradas a mano,
+# con un formulario para registrar/actualizar la venta de un dia sin
+# salir de la pagina (AJAX contra /api/registrar-venta, ver mas abajo) --
+# antes esto vivia en una pagina aparte (/registrar-venta, que se
+# mantiene intacta para no romper el enlace que ya usa /panel).
 PANEL_HTML = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Facturas procesadas</title>
+    <title>Facturas y ventas</title>
     """ + CABECERA_TAILWIND + """
 </head>
 <body class="min-h-screen bg-gray-50 font-sans text-gray-900">
     {{ barra_nav|safe }}
-    <main class="mx-auto max-w-3xl px-4 py-8">
-        <h1 class="text-xl font-bold text-gray-900">Facturas procesadas ({{ facturas|length }})</h1>
-        {% if not facturas %}
-            <p class="mt-4 text-sm text-gray-500">Todavia no hay facturas procesadas.</p>
-        {% endif %}
-        <div class="mt-5 space-y-4">
-        {% for factura in facturas %}
-        <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-            <h3 class="flex flex-wrap items-center gap-2 text-base font-semibold text-gray-900">
-                {{ factura.proveedor_nombre or 'Proveedor no detectado' }}
-                {% if factura.editado_manualmente %}<span class="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">editado a mano</span>{% endif %}
-            </h3>
-            {% if factura.nit %}
-            <p class="text-xs text-gray-500">NIT: {{ factura.nit }}</p>
-            {% endif %}
-            {% if factura.telefono_proveedor %}
-            <p class="mt-1 text-sm text-gray-600">Tel. proveedor: {{ factura.telefono_proveedor }}</p>
-            {% endif %}
-            {% if factura.direccion_proveedor %}
-            <p class="mt-1 text-sm text-gray-600">Dir. proveedor: {{ factura.direccion_proveedor }}</p>
-            {% endif %}
-            {% if factura.numero_factura %}
-            <p class="mt-1 text-sm text-gray-600">No. factura: {{ factura.numero_factura }}</p>
-            {% endif %}
-            <p class="mt-2 text-sm text-gray-600">Procesada: {{ factura.fecha_procesado }}</p>
-            <p class="text-sm text-gray-600">Fecha de factura: {% if factura.fecha_factura %}{{ factura.fecha_factura }}{% else %}no detectada{% endif %}</p>
-            <p class="mt-2 text-lg font-bold text-orange-600">Total: {% if factura.total is not none %}${{ factura.total | cop }}{% else %}sin total detectado{% endif %}</p>
-            {% if factura.impuesto is not none %}
-            <p class="text-sm text-gray-600">Impuesto: ${{ factura.impuesto | cop }}</p>
-            {% endif %}
-            {% if factura.comprador_nombre or factura.telefono_comprador or factura.direccion_comprador %}
-            <div class="mt-3 border-l-2 border-gray-200 pl-3">
-                <p class="text-xs font-medium uppercase tracking-wide text-gray-400">Vendido a</p>
-                {% if factura.comprador_nombre %}<p class="text-sm text-gray-600">{{ factura.comprador_nombre }}</p>{% endif %}
-                {% if factura.telefono_comprador %}<p class="text-sm text-gray-600">Tel: {{ factura.telefono_comprador }}</p>{% endif %}
-                {% if factura.direccion_comprador %}<p class="text-sm text-gray-600">{{ factura.direccion_comprador }}</p>{% endif %}
-            </div>
-            {% endif %}
-            {% if factura.validacion.estado == 'no_cuadra' %}
-            <p class="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-                &#9888; El total no cuadra con la suma de los items (${{ factura.validacion.suma_subtotales | cop }}){% if factura.impuesto is not none %} ni sumandole el impuesto{% endif %} -- revisar la imagen original.
-            </p>
-            {% elif factura.validacion.estado == 'sin_impuesto' %}
-            <p class="mt-3 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-600">
-                El total parece no incluir el impuesto por encima de la suma de items (${{ factura.validacion.suma_subtotales | cop }}).
-            </p>
-            {% endif %}
-            {% if factura.imagen_url %}
-            <p class="mt-3 text-sm"><a href="{{ factura.imagen_url }}" target="_blank" rel="noopener" class="font-medium text-blue-600 hover:underline">Ver imagen original de la factura</a></p>
-            {% endif %}
-            <p class="mt-1 text-sm"><a href="/facturas/{{ factura.factura_id }}/editar" class="font-medium text-blue-600 hover:underline">Editar esta factura &rarr;</a></p>
-            <table class="mt-3 w-full text-sm">
-                <tr class="border-b border-gray-200 text-left text-xs uppercase tracking-wide text-gray-400">
-                    <th class="py-1.5 pr-2 font-medium">Descripcion</th><th class="py-1.5 pr-2 font-medium">Cant.</th><th class="py-1.5 pr-2 font-medium">Precio</th><th class="py-1.5 font-medium">Subtotal</th>
-                </tr>
-                {% for item in factura.lineas %}
-                <tr class="border-b border-gray-100 text-gray-700">
-                    <td class="py-1.5 pr-2">{{ item.descripcion or '-' }}</td>
-                    <td class="py-1.5 pr-2">{{ item.cantidad if item.cantidad is not none else '-' }}</td>
-                    <td class="py-1.5 pr-2">{% if item.precio_unitario is not none %}${{ item.precio_unitario | cop }}{% else %}-{% endif %}</td>
-                    <td class="py-1.5">{% if item.subtotal is not none %}${{ item.subtotal | cop }}{% else %}-{% endif %}</td>
-                </tr>
-                {% endfor %}
-            </table>
+    <main class="mx-auto max-w-6xl px-4 py-8">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+            <h1 class="text-xl font-bold text-gray-900">Facturas y ventas</h1>
+            <form method="GET" action="/facturas" class="flex flex-wrap items-center gap-2">
+                <label class="text-sm font-medium text-gray-600">Filtrar por fecha
+                    <input type="date" name="fecha" value="{{ fecha_filtro or '' }}"
+                        class="ml-2 rounded-md border border-gray-300 px-2.5 py-1.5 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                </label>
+                <button type="submit" class="rounded-md bg-gray-800 px-3 py-1.5 text-sm font-medium text-white hover:bg-gray-900">Filtrar</button>
+                {% if fecha_filtro %}<a href="/facturas" class="text-sm font-medium text-blue-600 hover:underline">Ver todas</a>{% endif %}
+            </form>
         </div>
-        {% endfor %}
+
+        <div class="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
+
+            <!-- Columna izquierda: facturas digitalizadas -->
+            <div class="lg:col-span-2">
+                <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">
+                    Facturas procesadas ({{ facturas|length }}){% if fecha_filtro %} -- {{ fecha_filtro }}{% endif %}
+                </h2>
+                {% if not facturas %}
+                    <p class="mt-4 text-sm text-gray-500">
+                        {% if fecha_filtro %}No hay facturas procesadas en esa fecha.{% else %}Todavia no hay facturas procesadas.{% endif %}
+                    </p>
+                {% endif %}
+                <div class="mt-4 space-y-4">
+                {% for factura in facturas %}
+                <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+                    <h3 class="flex flex-wrap items-center gap-2 text-base font-semibold text-gray-900">
+                        {{ factura.proveedor_nombre or 'Proveedor no detectado' }}
+                        {% if factura.editado_manualmente %}<span class="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">editado a mano</span>{% endif %}
+                    </h3>
+                    {% if factura.nit %}
+                    <p class="text-xs text-gray-500">NIT: {{ factura.nit }}</p>
+                    {% endif %}
+                    {% if factura.telefono_proveedor %}
+                    <p class="mt-1 text-sm text-gray-600">Tel. proveedor: {{ factura.telefono_proveedor }}</p>
+                    {% endif %}
+                    {% if factura.direccion_proveedor %}
+                    <p class="mt-1 text-sm text-gray-600">Dir. proveedor: {{ factura.direccion_proveedor }}</p>
+                    {% endif %}
+                    {% if factura.numero_factura %}
+                    <p class="mt-1 text-sm text-gray-600">No. factura: {{ factura.numero_factura }}</p>
+                    {% endif %}
+                    <p class="mt-2 text-sm text-gray-600">Procesada: {{ factura.fecha_procesado }}</p>
+                    <p class="text-sm text-gray-600">Fecha de factura: {% if factura.fecha_factura %}{{ factura.fecha_factura }}{% else %}no detectada{% endif %}</p>
+                    <p class="mt-2 text-lg font-bold text-orange-600">Total: {% if factura.total is not none %}${{ factura.total | cop }}{% else %}sin total detectado{% endif %}</p>
+                    {% if factura.impuesto is not none %}
+                    <p class="text-sm text-gray-600">Impuesto: ${{ factura.impuesto | cop }}</p>
+                    {% endif %}
+                    {% if factura.comprador_nombre or factura.telefono_comprador or factura.direccion_comprador %}
+                    <div class="mt-3 border-l-2 border-gray-200 pl-3">
+                        <p class="text-xs font-medium uppercase tracking-wide text-gray-400">Vendido a</p>
+                        {% if factura.comprador_nombre %}<p class="text-sm text-gray-600">{{ factura.comprador_nombre }}</p>{% endif %}
+                        {% if factura.telefono_comprador %}<p class="text-sm text-gray-600">Tel: {{ factura.telefono_comprador }}</p>{% endif %}
+                        {% if factura.direccion_comprador %}<p class="text-sm text-gray-600">{{ factura.direccion_comprador }}</p>{% endif %}
+                    </div>
+                    {% endif %}
+                    {% if factura.validacion.estado == 'no_cuadra' %}
+                    <p class="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                        &#9888; El total no cuadra con la suma de los items (${{ factura.validacion.suma_subtotales | cop }}){% if factura.impuesto is not none %} ni sumandole el impuesto{% endif %} -- revisar la imagen original.
+                    </p>
+                    {% elif factura.validacion.estado == 'sin_impuesto' %}
+                    <p class="mt-3 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-600">
+                        El total parece no incluir el impuesto por encima de la suma de items (${{ factura.validacion.suma_subtotales | cop }}).
+                    </p>
+                    {% endif %}
+                    {% if factura.imagen_url %}
+                    <p class="mt-3 text-sm"><a href="{{ factura.imagen_url }}" target="_blank" rel="noopener" class="font-medium text-blue-600 hover:underline">Ver imagen original de la factura</a></p>
+                    {% endif %}
+                    <p class="mt-1 text-sm"><a href="/facturas/{{ factura.factura_id }}/editar" class="font-medium text-blue-600 hover:underline">Editar esta factura &rarr;</a></p>
+                    <table class="mt-3 w-full text-sm">
+                        <tr class="border-b border-gray-200 text-left text-xs uppercase tracking-wide text-gray-400">
+                            <th class="py-1.5 pr-2 font-medium">Descripcion</th><th class="py-1.5 pr-2 font-medium">Cant.</th><th class="py-1.5 pr-2 font-medium">Precio</th><th class="py-1.5 font-medium">Subtotal</th>
+                        </tr>
+                        {% for item in factura.lineas %}
+                        <tr class="border-b border-gray-100 text-gray-700">
+                            <td class="py-1.5 pr-2">{{ item.descripcion or '-' }}</td>
+                            <td class="py-1.5 pr-2">{{ item.cantidad if item.cantidad is not none else '-' }}</td>
+                            <td class="py-1.5 pr-2">{% if item.precio_unitario is not none %}${{ item.precio_unitario | cop }}{% else %}-{% endif %}</td>
+                            <td class="py-1.5">{% if item.subtotal is not none %}${{ item.subtotal | cop }}{% else %}-{% endif %}</td>
+                        </tr>
+                        {% endfor %}
+                    </table>
+                </div>
+                {% endfor %}
+                </div>
+            </div>
+
+            <!-- Columna derecha: ventas registradas a mano -->
+            <div class="space-y-6">
+                <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+                    <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">Registrar venta</h2>
+                    <div class="mt-3 space-y-3">
+                        <label class="block text-sm font-medium text-gray-600">Fecha
+                            <input type="date" id="venta_fecha" value="{{ fecha_filtro or fecha_hoy }}"
+                                class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                        </label>
+                        <label class="block text-sm font-medium text-gray-600">Venta total del dia (COP)
+                            <input type="number" id="venta_monto" step="0.01" min="0"
+                                class="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-orange-500 focus:outline-none focus:ring-1 focus:ring-orange-500">
+                        </label>
+                        <button onclick="registrarVenta()"
+                            class="w-full rounded-md bg-orange-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-orange-600">
+                            Guardar
+                        </button>
+                        <div id="venta_estado" class="text-sm font-medium text-gray-700"></div>
+                    </div>
+                </div>
+
+                <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+                    <h2 class="text-sm font-semibold uppercase tracking-wide text-gray-500">Ventas registradas (ultimos 30 dias)</h2>
+                    {% if not ventas_recientes %}
+                    <p id="ventas_vacio" class="mt-3 text-sm text-gray-500">Todavia no hay ventas registradas.</p>
+                    {% endif %}
+                    <table class="mt-3 w-full text-sm">
+                        <tbody id="tabla_ventas">
+                        {% for venta in ventas_recientes %}
+                        <tr class="border-b border-gray-100 text-gray-700 last:border-0">
+                            <td class="py-1.5 pr-2">{{ venta.dia }}</td>
+                            <td class="py-1.5 text-right font-medium">${{ venta.total | cop }}</td>
+                        </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
         </div>
     </main>
+
+    <script>
+        // Registra (o actualiza, si ya existia una venta ese dia -- mismo
+        // ON CONFLICT DO UPDATE de siempre) la venta de un dia sin recargar
+        // la pagina. El servidor responde con la lista completa de ventas
+        // de los ultimos 30 dias ya formateada, asi que la tabla se
+        // reemplaza entera en vez de intentar adivinar donde insertar o
+        // actualizar la fila -- mas simple y sin riesgo de que quede
+        // desordenada o duplicada.
+        async function registrarVenta() {
+            const fecha = document.getElementById('venta_fecha').value;
+            const monto = document.getElementById('venta_monto').value;
+            const estado = document.getElementById('venta_estado');
+            if (!fecha || !monto) {
+                estado.textContent = 'Completa la fecha y el monto.';
+                return;
+            }
+            estado.textContent = 'Guardando...';
+            try {
+                const respuestaHttp = await fetch('/api/registrar-venta', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ fecha: fecha, monto: monto })
+                });
+                const datos = await respuestaHttp.json();
+                if (datos.ok) {
+                    estado.textContent = datos.mensaje;
+                    const tabla = document.getElementById('tabla_ventas');
+                    const vacio = document.getElementById('ventas_vacio');
+                    if (vacio) vacio.remove();
+                    tabla.innerHTML = '';
+                    datos.ventas.forEach(function (venta) {
+                        const fila = document.createElement('tr');
+                        fila.className = 'border-b border-gray-100 text-gray-700 last:border-0';
+                        const celdaFecha = document.createElement('td');
+                        celdaFecha.className = 'py-1.5 pr-2';
+                        celdaFecha.textContent = venta.dia;
+                        const celdaMonto = document.createElement('td');
+                        celdaMonto.className = 'py-1.5 text-right font-medium';
+                        celdaMonto.textContent = '$' + venta.total_formateado;
+                        fila.appendChild(celdaFecha);
+                        fila.appendChild(celdaMonto);
+                        tabla.appendChild(fila);
+                    });
+                } else {
+                    estado.textContent = datos.error || 'No se pudo guardar la venta.';
+                }
+            } catch (error) {
+                estado.textContent = 'Hubo un error de conexion. Intenta de nuevo.';
+            }
+        }
+    </script>
 </body>
 </html>
 """
@@ -539,7 +799,50 @@ EDITAR_FACTURA_HTML = """
 
 @app.route('/')
 def index():
-    return render_template_string(PAGINA_HTML, barra_nav=generar_barra_nav('/'))
+    # El tablero reutiliza exactamente las mismas funciones obtener_*()
+    # que ya usa panel() (ver seccion 5.40 de la bitacora) -- ningun query
+    # SQL nuevo, solo se le pasa a esta plantilla un subconjunto de las
+    # mismas variables, mas total_facturas para la tarjeta de acceso a
+    # "/facturas".
+    hoy = date.today()
+    inicio_30 = hoy - timedelta(days=29)
+
+    conexion = pg8000.native.Connection(
+        user=DB_USER, password=DB_PASSWORD,
+        host=DB_HOST, port=DB_PORT, database=DB_NAME
+    )
+    try:
+        gasto_por_dia = obtener_gasto_por_dia(conexion, inicio_30, hoy)
+        venta_por_dia = obtener_venta_por_dia(conexion, inicio_30, hoy)
+        resumen_gasto_hoy = obtener_resumen_gasto(conexion, hoy, hoy)
+        comparacion_periodos = obtener_comparacion_periodos(conexion, hoy)
+        comparacion_gasto_venta = obtener_comparacion_gasto_venta(conexion, inicio_30, hoy)
+        total_facturas = conexion.run("SELECT COUNT(*) FROM factura")[0][0]
+    finally:
+        conexion.close()
+
+    # Mismo relleno de dias sin dato con 0 que usa panel(), para que las
+    # dos series del mini-grafico queden alineadas en el eje de tiempo.
+    mapa_gasto = {fila['dia']: fila['total'] for fila in gasto_por_dia}
+    mapa_venta = {fila['dia']: fila['total'] for fila in venta_por_dia}
+    dias = [str(inicio_30 + timedelta(days=i)) for i in range(30)]
+    datos_grafica = {
+        'dias': dias,
+        'gasto': [mapa_gasto.get(d, 0) for d in dias],
+        'venta': [mapa_venta.get(d, 0) for d in dias],
+    }
+    venta_hoy = mapa_venta.get(str(hoy))
+
+    return render_template_string(
+        DASHBOARD_HTML,
+        resumen_gasto_hoy=resumen_gasto_hoy,
+        venta_hoy=venta_hoy,
+        comparacion_periodos=comparacion_periodos,
+        comparacion_gasto_venta=comparacion_gasto_venta,
+        datos_grafica=datos_grafica,
+        total_facturas=total_facturas,
+        barra_nav=generar_barra_nav('/')
+    )
 
 @app.route('/get-upload-url')
 def get_upload_url():
@@ -555,6 +858,21 @@ def get_upload_url():
 
 @app.route('/facturas')
 def ver_facturas():
+    # Filtro de fecha opcional (?fecha=AAAA-MM-DD), agregado en la seccion
+    # 5.41 de la bitacora. Un valor invalido o ausente simplemente se
+    # ignora (se listan todas las facturas), en vez de devolver un error
+    # 500 -- mismo criterio de tolerancia a datos mal escritos que ya usa
+    # registrar_venta().
+    fecha_filtro = request.args.get('fecha') or None
+    if fecha_filtro:
+        try:
+            fecha_filtro_valor = date.fromisoformat(fecha_filtro)
+        except ValueError:
+            fecha_filtro = None
+            fecha_filtro_valor = None
+    else:
+        fecha_filtro_valor = None
+
     conexion = pg8000.native.Connection(
         user=DB_USER, password=DB_PASSWORD,
         host=DB_HOST, port=DB_PORT, database=DB_NAME
@@ -565,13 +883,19 @@ def ver_facturas():
         # falta ningun cambio de esquema ni de backfill para agregar esto:
         # el dato de todas las facturas ya procesadas estaba disponible,
         # solo no se estaba leyendo ni mostrando.
-        filas_factura = conexion.run(
-            """
-            SELECT factura_id, proveedor_nombre, nit, fecha_factura, total, impuesto, fecha_procesado, s3_key, editado_manualmente,
-                   telefono_proveedor, direccion_proveedor, comprador_nombre, telefono_comprador, direccion_comprador, numero_factura
-            FROM factura ORDER BY fecha_procesado DESC
-            """
-        )
+        columnas_factura = """
+            factura_id, proveedor_nombre, nit, fecha_factura, total, impuesto, fecha_procesado, s3_key, editado_manualmente,
+            telefono_proveedor, direccion_proveedor, comprador_nombre, telefono_comprador, direccion_comprador, numero_factura
+        """
+        if fecha_filtro_valor:
+            filas_factura = conexion.run(
+                f"SELECT {columnas_factura} FROM factura WHERE fecha_procesado::date = :fecha ORDER BY fecha_procesado DESC",
+                fecha=fecha_filtro_valor
+            )
+        else:
+            filas_factura = conexion.run(
+                f"SELECT {columnas_factura} FROM factura ORDER BY fecha_procesado DESC"
+            )
         facturas = []
         for fila in filas_factura:
             (
@@ -620,9 +944,26 @@ def ver_facturas():
                 'imagen_url': imagen_url,
                 'validacion': validar_total_factura(total, impuesto, lineas)
             })
-        return render_template_string(PANEL_HTML, facturas=facturas, barra_nav=generar_barra_nav('/facturas'))
+
+        # Ventas de los ultimos 30 dias para la columna derecha -- misma
+        # funcion que ya usa panel() (obtener_venta_por_dia), ordenadas de
+        # mas reciente a mas antigua para esta lista (panel() la usa en
+        # orden cronologico para la grafica, asi que no se reutiliza el
+        # orden, solo la consulta).
+        hoy = date.today()
+        ventas_recientes = obtener_venta_por_dia(conexion, hoy - timedelta(days=29), hoy)
+        ventas_recientes.sort(key=lambda venta: venta['dia'], reverse=True)
     finally:
         conexion.close()
+
+    return render_template_string(
+        PANEL_HTML,
+        facturas=facturas,
+        fecha_filtro=fecha_filtro,
+        fecha_hoy=str(date.today()),
+        ventas_recientes=ventas_recientes,
+        barra_nav=generar_barra_nav('/facturas')
+    )
 
 
 # Formulario de edicion manual de una factura -- punto 1 de la lista de
@@ -1313,6 +1654,48 @@ def registrar_venta():
         fecha_hoy=str(date.today()),
         barra_nav=generar_barra_nav('/registrar-venta')
     )
+
+
+# Version en JSON de registrar_venta(), agregada en la seccion 5.41 de la
+# bitacora para el boton "Registrar venta" inline de /facturas (envio por
+# AJAX, sin recargar la pagina). Misma validacion y misma funcion de
+# guardado (registrar_venta_diaria, con el mismo ON CONFLICT DO UPDATE)
+# que la ruta de formulario de arriba -- no se duplica logica de negocio,
+# solo cambia el formato de entrada/salida (JSON en vez de un form POST).
+@app.route('/api/registrar-venta', methods=['POST'])
+def api_registrar_venta():
+    cuerpo = request.get_json(silent=True) or {}
+    fecha_texto = cuerpo.get('fecha')
+    monto_texto = cuerpo.get('monto')
+    try:
+        fecha_valor = date.fromisoformat(fecha_texto)
+        monto_valor = float(monto_texto)
+    except (ValueError, TypeError):
+        return jsonify({'ok': False, 'error': 'Datos invalidos. Verifica la fecha y el monto.'}), 400
+
+    conexion = pg8000.native.Connection(
+        user=DB_USER, password=DB_PASSWORD,
+        host=DB_HOST, port=DB_PORT, database=DB_NAME
+    )
+    try:
+        registrar_venta_diaria(conexion, fecha_valor, monto_valor)
+
+        hoy = date.today()
+        ventas_recientes = obtener_venta_por_dia(conexion, hoy - timedelta(days=29), hoy)
+    finally:
+        conexion.close()
+
+    ventas_recientes.sort(key=lambda venta: venta['dia'], reverse=True)
+    ventas_json = [
+        {'dia': venta['dia'], 'total_formateado': formatear_numero(venta['total'])}
+        for venta in ventas_recientes
+    ]
+
+    return jsonify({
+        'ok': True,
+        'mensaje': f"Venta del {fecha_valor} guardada: ${formatear_numero(monto_valor)}",
+        'ventas': ventas_json
+    })
 
 
 # =====================================================================
