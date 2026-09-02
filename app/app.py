@@ -292,6 +292,9 @@ PANEL_HTML = """
         .factura .info-total { color: #444; font-size: 13px; background: #F0F0F0; border: 1px solid #DDD; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
         .factura .editado { color: #666; font-size: 12px; font-weight: normal; background: #EEE; border-radius: 4px; padding: 2px 6px; margin-left: 6px; }
         .factura .editar { display: inline-block; margin-top: 8px; font-size: 13px; }
+        .factura .dato-extra { color: #666; font-size: 13px; margin: 2px 0; }
+        .factura .comprador { border-left: 3px solid #eee; padding-left: 10px; margin-top: 8px; }
+        .factura .comprador-titulo { color: #999; font-size: 11px; text-transform: uppercase; margin: 0 0 2px 0; }
         .factura table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
         .factura th, .factura td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #eee; }
         .vacio { color: #777; }
@@ -310,11 +313,28 @@ PANEL_HTML = """
         {% if factura.nit %}
         <p class="nit">NIT: {{ factura.nit }}</p>
         {% endif %}
+        {% if factura.telefono_proveedor %}
+        <p class="dato-extra">Tel. proveedor: {{ factura.telefono_proveedor }}</p>
+        {% endif %}
+        {% if factura.direccion_proveedor %}
+        <p class="dato-extra">Dir. proveedor: {{ factura.direccion_proveedor }}</p>
+        {% endif %}
+        {% if factura.numero_factura %}
+        <p class="dato-extra">No. factura: {{ factura.numero_factura }}</p>
+        {% endif %}
         <p>Procesada: {{ factura.fecha_procesado }}</p>
         <p>Fecha de factura: {% if factura.fecha_factura %}{{ factura.fecha_factura }}{% else %}no detectada{% endif %}</p>
         <p class="total">Total: {% if factura.total is not none %}${{ factura.total | cop }}{% else %}sin total detectado{% endif %}</p>
         {% if factura.impuesto is not none %}
         <p class="impuesto">Impuesto: ${{ factura.impuesto | cop }}</p>
+        {% endif %}
+        {% if factura.comprador_nombre or factura.telefono_comprador or factura.direccion_comprador %}
+        <div class="comprador">
+            <p class="comprador-titulo">Vendido a</p>
+            {% if factura.comprador_nombre %}<p class="dato-extra">{{ factura.comprador_nombre }}</p>{% endif %}
+            {% if factura.telefono_comprador %}<p class="dato-extra">Tel: {{ factura.telefono_comprador }}</p>{% endif %}
+            {% if factura.direccion_comprador %}<p class="dato-extra">{{ factura.direccion_comprador }}</p>{% endif %}
+        </div>
         {% endif %}
         {% if factura.validacion.estado == 'no_cuadra' %}
         <p class="alerta-total">
@@ -387,11 +407,8 @@ EDITAR_FACTURA_HTML = """
         nunca como cero, para no reemplazar un error por otro.
     </p>
     <form method="POST">
-        <label>Proveedor
-            <input type="text" name="proveedor_nombre" value="{{ factura.proveedor_nombre or '' }}">
-        </label>
-        <label>NIT
-            <input type="text" name="nit" value="{{ factura.nit or '' }}">
+        <label>Numero de factura
+            <input type="text" name="numero_factura" value="{{ factura.numero_factura or '' }}">
         </label>
         <label>Fecha de factura
             <input type="date" name="fecha_factura" value="{{ factura.fecha_factura or '' }}">
@@ -401,6 +418,31 @@ EDITAR_FACTURA_HTML = """
         </label>
         <label>Impuesto
             <input type="number" step="0.01" name="impuesto" value="{{ factura.impuesto if factura.impuesto is not none else '' }}">
+        </label>
+
+        <h2>Proveedor</h2>
+        <label>Nombre
+            <input type="text" name="proveedor_nombre" value="{{ factura.proveedor_nombre or '' }}">
+        </label>
+        <label>NIT
+            <input type="text" name="nit" value="{{ factura.nit or '' }}">
+        </label>
+        <label>Telefono
+            <input type="text" name="telefono_proveedor" value="{{ factura.telefono_proveedor or '' }}">
+        </label>
+        <label>Direccion
+            <input type="text" name="direccion_proveedor" value="{{ factura.direccion_proveedor or '' }}">
+        </label>
+
+        <h2>Comprador</h2>
+        <label>Nombre
+            <input type="text" name="comprador_nombre" value="{{ factura.comprador_nombre or '' }}">
+        </label>
+        <label>Telefono
+            <input type="text" name="telefono_comprador" value="{{ factura.telefono_comprador or '' }}">
+        </label>
+        <label>Direccion
+            <input type="text" name="direccion_comprador" value="{{ factura.direccion_comprador or '' }}">
         </label>
 
         <h2>Items</h2>
@@ -462,11 +504,18 @@ def ver_facturas():
         # el dato de todas las facturas ya procesadas estaba disponible,
         # solo no se estaba leyendo ni mostrando.
         filas_factura = conexion.run(
-            "SELECT factura_id, proveedor_nombre, nit, fecha_factura, total, impuesto, fecha_procesado, s3_key, editado_manualmente FROM factura ORDER BY fecha_procesado DESC"
+            """
+            SELECT factura_id, proveedor_nombre, nit, fecha_factura, total, impuesto, fecha_procesado, s3_key, editado_manualmente,
+                   telefono_proveedor, direccion_proveedor, comprador_nombre, telefono_comprador, direccion_comprador, numero_factura
+            FROM factura ORDER BY fecha_procesado DESC
+            """
         )
         facturas = []
         for fila in filas_factura:
-            factura_id, proveedor, nit, fecha_factura, total, impuesto, fecha_procesado, s3_key, editado_manualmente = fila
+            (
+                factura_id, proveedor, nit, fecha_factura, total, impuesto, fecha_procesado, s3_key, editado_manualmente,
+                telefono_proveedor, direccion_proveedor, comprador_nombre, telefono_comprador, direccion_comprador, numero_factura
+            ) = fila
             filas_item = conexion.run(
                 "SELECT descripcion, cantidad, precio_unitario, subtotal FROM item_factura WHERE factura_id = :fid",
                 fid=factura_id
@@ -499,6 +548,12 @@ def ver_facturas():
                 'impuesto': impuesto,
                 'fecha_procesado': fecha_procesado,
                 'editado_manualmente': editado_manualmente,
+                'telefono_proveedor': telefono_proveedor,
+                'direccion_proveedor': direccion_proveedor,
+                'comprador_nombre': comprador_nombre,
+                'telefono_comprador': telefono_comprador,
+                'direccion_comprador': direccion_comprador,
+                'numero_factura': numero_factura,
                 'lineas': lineas,
                 'imagen_url': imagen_url,
                 'validacion': validar_total_factura(total, impuesto, lineas)
@@ -537,6 +592,12 @@ def editar_factura(factura_id):
                     fecha_factura = :fecha_factura,
                     total = :total,
                     impuesto = :impuesto,
+                    telefono_proveedor = :telefono_proveedor,
+                    direccion_proveedor = :direccion_proveedor,
+                    comprador_nombre = :comprador_nombre,
+                    telefono_comprador = :telefono_comprador,
+                    direccion_comprador = :direccion_comprador,
+                    numero_factura = :numero_factura,
                     editado_manualmente = TRUE,
                     fecha_ultima_edicion = NOW()
                 WHERE factura_id = :factura_id
@@ -546,6 +607,12 @@ def editar_factura(factura_id):
                 fecha_factura=campo_fecha_o_none(request.form.get('fecha_factura')),
                 total=campo_numerico_o_none(request.form.get('total')),
                 impuesto=campo_numerico_o_none(request.form.get('impuesto')),
+                telefono_proveedor=campo_texto_o_none(request.form.get('telefono_proveedor')),
+                direccion_proveedor=campo_texto_o_none(request.form.get('direccion_proveedor')),
+                comprador_nombre=campo_texto_o_none(request.form.get('comprador_nombre')),
+                telefono_comprador=campo_texto_o_none(request.form.get('telefono_comprador')),
+                direccion_comprador=campo_texto_o_none(request.form.get('direccion_comprador')),
+                numero_factura=campo_texto_o_none(request.form.get('numero_factura')),
                 factura_id=factura_id
             )
 
@@ -574,13 +641,24 @@ def editar_factura(factura_id):
             return redirect(url_for('ver_facturas'))
 
         fila = conexion.run(
-            "SELECT proveedor_nombre, nit, fecha_factura, total, impuesto FROM factura WHERE factura_id = :fid",
+            """
+            SELECT proveedor_nombre, nit, fecha_factura, total, impuesto,
+                   telefono_proveedor, direccion_proveedor,
+                   comprador_nombre, telefono_comprador, direccion_comprador,
+                   numero_factura
+            FROM factura WHERE factura_id = :fid
+            """,
             fid=factura_id
         )
         if not fila:
             return 'Factura no encontrada', 404
 
-        proveedor_nombre, nit, fecha_factura, total, impuesto = fila[0]
+        (
+            proveedor_nombre, nit, fecha_factura, total, impuesto,
+            telefono_proveedor, direccion_proveedor,
+            comprador_nombre, telefono_comprador, direccion_comprador,
+            numero_factura
+        ) = fila[0]
         factura = {
             'proveedor_nombre': proveedor_nombre,
             'nit': nit,
@@ -589,7 +667,13 @@ def editar_factura(factura_id):
             # el input type="date" del formulario espera su atributo value.
             'fecha_factura': fecha_factura.isoformat() if fecha_factura else None,
             'total': total,
-            'impuesto': impuesto
+            'impuesto': impuesto,
+            'telefono_proveedor': telefono_proveedor,
+            'direccion_proveedor': direccion_proveedor,
+            'comprador_nombre': comprador_nombre,
+            'telefono_comprador': telefono_comprador,
+            'direccion_comprador': direccion_comprador,
+            'numero_factura': numero_factura
         }
 
         filas_item = conexion.run(

@@ -276,6 +276,20 @@ def extraer_nit_probable(response):
         )
     return candidatos[0]
 
+# Convierte un texto de Textract a None si viene vacio -- cadena vacia
+# (paso con RECEIVER_PHONE en una factura real de prueba: Textract detecto
+# el TIPO de campo pero el VALOR quedo en blanco) o solo espacios en
+# blanco. Mismo criterio de NULL vs. dato inventado que ya siguen
+# limpiar_numero() y parsear_fecha() con los campos numericos y de fecha --
+# aqui no hace falta ninguna limpieza de formato (a diferencia de esas dos),
+# porque telefono, direccion y numero de factura son identificadores/texto
+# libre, no cantidades ni fechas que se puedan interpretar mal.
+def campo_texto_o_none(texto):
+    if not texto:
+        return None
+    texto = texto.strip()
+    return texto if texto else None
+
 # Se conecta a RDS, inserta una fila en 'factura' con los datos generales,
 # y una fila en 'item_factura' por cada item detectado, enlazadas mediante
 # el factura_id que genera la base de datos automaticamente.
@@ -305,10 +319,29 @@ def guardar_en_rds(campos, items, s3_key, nit):
         # guarda como texto tal cual, sin limpiar puntos ni guiones -- a
         # diferencia de un campo numerico, el NIT es un identificador, no
         # una cantidad para operar aritmeticamente.
+        # Punto 2 de la lista de mejoras del usuario (2026-09-02): telefono y
+        # direccion del proveedor y del comprador, y numero de factura --
+        # Textract ya los detecta con tipos de campo propios (VENDOR_PHONE,
+        # VENDOR_ADDRESS, RECEIVER_NAME, RECEIVER_PHONE, RECEIVER_ADDRESS,
+        # INVOICE_RECEIPT_ID), pero hasta ahora quedaban solo dentro de
+        # datos_textract_raw sin extraerse a su propia columna -- mismo
+        # patron ya usado con impuesto (5.28) y NIT (5.33). De estos, solo
+        # VENDOR_ADDRESS, RECEIVER_NAME, RECEIVER_PHONE e INVOICE_RECEIPT_ID
+        # se confirmaron con datos reales (factura del Hotel Prado del
+        # Huila); VENDOR_PHONE y RECEIVER_ADDRESS se agregan igual, por ser
+        # tipos de campo estandar documentados por Textract, bajo el mismo
+        # criterio que ya se sigue en todo el proyecto: si Textract nunca
+        # los detecta, quedan en NULL, nunca en un valor inventado.
         resultado = conexion.run(
             """
-            INSERT INTO factura (proveedor_nombre, nit, fecha_factura, total, impuesto, s3_key, datos_textract_raw)
-            VALUES (:proveedor, :nit, :fecha, :total, :impuesto, :s3_key, :raw)
+            INSERT INTO factura (
+                proveedor_nombre, nit, fecha_factura, total, impuesto, s3_key, datos_textract_raw,
+                telefono_proveedor, direccion_proveedor, comprador_nombre, telefono_comprador, direccion_comprador, numero_factura
+            )
+            VALUES (
+                :proveedor, :nit, :fecha, :total, :impuesto, :s3_key, :raw,
+                :telefono_proveedor, :direccion_proveedor, :comprador_nombre, :telefono_comprador, :direccion_comprador, :numero_factura
+            )
             RETURNING factura_id
             """,
             proveedor=campos.get('VENDOR_NAME'),
@@ -317,7 +350,13 @@ def guardar_en_rds(campos, items, s3_key, nit):
             total=limpiar_numero(campos.get('TOTAL')),
             impuesto=limpiar_numero(campos.get('TAX')),
             s3_key=s3_key,
-            raw=json.dumps(campos)
+            raw=json.dumps(campos),
+            telefono_proveedor=campo_texto_o_none(campos.get('VENDOR_PHONE')),
+            direccion_proveedor=campo_texto_o_none(campos.get('VENDOR_ADDRESS')),
+            comprador_nombre=campo_texto_o_none(campos.get('RECEIVER_NAME')),
+            telefono_comprador=campo_texto_o_none(campos.get('RECEIVER_PHONE')),
+            direccion_comprador=campo_texto_o_none(campos.get('RECEIVER_ADDRESS')),
+            numero_factura=campo_texto_o_none(campos.get('INVOICE_RECEIPT_ID'))
         )
         factura_id = resultado[0][0]
 
@@ -469,6 +508,12 @@ def lambda_handler(event, context):
     print(f"Fecha detectada: {campos.get('INVOICE_RECEIPT_DATE', 'No detectada')} -> {parsear_fecha(campos.get('INVOICE_RECEIPT_DATE'))}")
     print(f"Total: {campos.get('TOTAL', 'No detectado')}")
     print(f"Impuesto: {campos.get('TAX', 'No detectado')}")
+    print(f"Numero de factura: {campo_texto_o_none(campos.get('INVOICE_RECEIPT_ID')) or 'No detectado'}")
+    print(f"Telefono proveedor: {campo_texto_o_none(campos.get('VENDOR_PHONE')) or 'No detectado'}")
+    print(f"Direccion proveedor: {campo_texto_o_none(campos.get('VENDOR_ADDRESS')) or 'No detectada'}")
+    print(f"Comprador: {campo_texto_o_none(campos.get('RECEIVER_NAME')) or 'No detectado'}")
+    print(f"Telefono comprador: {campo_texto_o_none(campos.get('RECEIVER_PHONE')) or 'No detectado'}")
+    print(f"Direccion comprador: {campo_texto_o_none(campos.get('RECEIVER_ADDRESS')) or 'No detectada'}")
     print(f"Items detectados: {len(items)}")
     print("==================================")
 
