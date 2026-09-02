@@ -168,6 +168,48 @@ TWILIO_AUTH_TOKEN = ssm.get_parameter(
 # boto3 -- se reutiliza en cada peticion al webhook de WhatsApp.
 validador_twilio = RequestValidator(TWILIO_AUTH_TOKEN)
 
+# --- Barra de navegacion compartida (punto 3 de las mejoras pedidas el
+# 2026-09-02: "consolidar la navegacion... en un dashboard unico").
+#
+# Opcion elegida (de las evaluadas en la bitacora): pestañas sobre las
+# paginas existentes, NO una pagina unica real con JS. Cada ruta sigue
+# siendo su propio endpoint de Flask que renderiza su propia plantilla --
+# lo unico nuevo es que las 5 plantillas comparten esta misma barra, con
+# la pestaña de la pagina actual resaltada, en vez de los enlaces de
+# "volver" sueltos y distintos que tenia cada una antes. Bajo riesgo:
+# no toca la logica de ningun formulario ni ruta existente.
+#
+# No se resuelve con un include de Jinja (no hay un DictLoader de
+# plantillas, son strings de Python) -- en vez de eso, esta funcion arma
+# el HTML ya resuelto en Python y cada ruta lo pasa como variable
+# (barra_nav) a render_template_string, para insertarla con {{ barra_nav|safe }}.
+PESTANAS_DASHBOARD = [
+    ('/', 'Subir factura'),
+    ('/facturas', 'Facturas'),
+    ('/panel', 'Panel'),
+    ('/registrar-venta', 'Registrar venta'),
+    ('/asistente', 'Asistente'),
+]
+
+BARRA_NAV_CSS = """
+        .barra-nav-dashboard { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 2px solid #eee; margin-bottom: 20px; }
+        .barra-nav-dashboard a { padding: 8px 14px; font-size: 14px; color: #555; text-decoration: none; border-radius: 6px 6px 0 0; }
+        .barra-nav-dashboard a:hover { background: #f5f5f5; }
+        .barra-nav-dashboard a.activa { color: #222; font-weight: bold; background: #FFF3E0; border-bottom: 2px solid #FF9900; margin-bottom: -2px; }
+    """
+
+
+def generar_barra_nav(ruta_activa):
+    """Arma el HTML de la barra de pestañas, marcando como activa la
+    pestaña de `ruta_activa`. Se resuelve en Python (no hay estado
+    dinamico que justifique hacerlo en Jinja)."""
+    enlaces = []
+    for ruta, etiqueta in PESTANAS_DASHBOARD:
+        clase = ' class="activa"' if ruta == ruta_activa else ''
+        enlaces.append(f'<a href="{ruta}"{clase}>{etiqueta}</a>')
+    return '<nav class="barra-nav-dashboard">' + ''.join(enlaces) + '</nav>'
+
+
 PAGINA_HTML = """
 <!DOCTYPE html>
 <html lang="es">
@@ -181,19 +223,16 @@ PAGINA_HTML = """
         input[type=file] { display: block; margin: 20px 0; }
         button { background: #FF9900; border: none; padding: 12px 20px; font-size: 16px; border-radius: 6px; }
         #estado { margin-top: 16px; font-weight: bold; }
-        .enlace-panel { display: block; margin-top: 24px; color: #0066cc; }
+        """ + BARRA_NAV_CSS + """
     </style>
 </head>
 <body>
+    {{ barra_nav|safe }}
     <h1>Digitalizar factura</h1>
     <p>Toma una foto de tu factura o recibo:</p>
     <input type="file" id="archivo" accept="image/*,application/pdf" capture="environment">
     <button onclick="subirFactura()">Subir factura</button>
     <div id="estado"></div>
-    <a class="enlace-panel" href="/facturas">Ver facturas procesadas &rarr;</a>
-    <a class="enlace-panel" href="/registrar-venta">Registrar venta del dia &rarr;</a>
-    <a class="enlace-panel" href="/panel">Ver panel de gestion &rarr;</a>
-    <a class="enlace-panel" href="/asistente">Preguntale a tu negocio &rarr;</a>
     <script>
         // Comprime y redimensiona una foto antes de subirla, usando un
         // <canvas> del navegador. Esto SOLO funciona con imagenes de verdad
@@ -298,11 +337,11 @@ PANEL_HTML = """
         .factura table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
         .factura th, .factura td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #eee; }
         .vacio { color: #777; }
-        .volver { display: inline-block; margin-bottom: 20px; }
+        """ + BARRA_NAV_CSS + """
     </style>
 </head>
 <body>
-    <a class="volver" href="/">&larr; Volver a subir factura</a>
+    {{ barra_nav|safe }}
     <h1>Facturas procesadas ({{ facturas|length }})</h1>
     {% if not facturas %}
         <p class="vacio">Todavia no hay facturas procesadas.</p>
@@ -396,10 +435,11 @@ EDITAR_FACTURA_HTML = """
         .item-grid label { margin-top: 0; }
         .vacio { color: #777; font-size: 14px; }
         button { background: #FF9900; border: none; padding: 12px 24px; font-size: 16px; border-radius: 6px; margin: 24px 0; cursor: pointer; }
+        """ + BARRA_NAV_CSS + """
     </style>
 </head>
 <body>
-    <a class="volver" href="/facturas">&larr; Volver a facturas</a>
+    {{ barra_nav|safe }}
     <h1>Editar factura #{{ factura_id }}</h1>
     <p class="aviso">
         Corrige aqui cualquier dato que Textract haya leido mal a partir de la imagen original.
@@ -477,7 +517,7 @@ EDITAR_FACTURA_HTML = """
 
 @app.route('/')
 def index():
-    return render_template_string(PAGINA_HTML)
+    return render_template_string(PAGINA_HTML, barra_nav=generar_barra_nav('/'))
 
 @app.route('/get-upload-url')
 def get_upload_url():
@@ -558,7 +598,7 @@ def ver_facturas():
                 'imagen_url': imagen_url,
                 'validacion': validar_total_factura(total, impuesto, lineas)
             })
-        return render_template_string(PANEL_HTML, facturas=facturas)
+        return render_template_string(PANEL_HTML, facturas=facturas, barra_nav=generar_barra_nav('/facturas'))
     finally:
         conexion.close()
 
@@ -688,7 +728,7 @@ def editar_factura(factura_id):
             for i in filas_item
         ]
 
-        return render_template_string(EDITAR_FACTURA_HTML, factura=factura, items=items, factura_id=factura_id)
+        return render_template_string(EDITAR_FACTURA_HTML, factura=factura, items=items, factura_id=factura_id, barra_nav=generar_barra_nav('/facturas'))
     finally:
         conexion.close()
 
@@ -992,10 +1032,11 @@ PANEL_GESTION_HTML = """
         th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
         .vacio { color: #777; font-size: 14px; }
         .aviso { background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: 10px 14px; font-size: 14px; margin-top: 8px; }
+        """ + BARRA_NAV_CSS + """
     </style>
 </head>
 <body>
-    <a class="volver" href="/">&larr; Volver a subir factura</a>
+    {{ barra_nav|safe }}
     <h1>Panel de gestion</h1>
 
     <div class="tarjetas">
@@ -1164,7 +1205,8 @@ def panel():
         facturas_incompletas=facturas_incompletas,
         comparacion_periodos=comparacion_periodos,
         comparacion_gasto_venta=comparacion_gasto_venta,
-        datos_grafica=datos_grafica
+        datos_grafica=datos_grafica,
+        barra_nav=generar_barra_nav('/panel')
     )
 
 
@@ -1184,9 +1226,12 @@ FORM_VENTA_HTML = """
 <head>
     <meta charset="UTF-8">
     <title>Registrar venta del dia</title>
+    <style>
+        """ + BARRA_NAV_CSS + """
+    </style>
 </head>
 <body>
-    <p><a href="/">&larr; Volver</a></p>
+    {{ barra_nav|safe }}
     <h1>Registrar venta del dia</h1>
     {% if mensaje %}
         <p><strong>{{ mensaje }}</strong></p>
@@ -1231,7 +1276,8 @@ def registrar_venta():
     return render_template_string(
         FORM_VENTA_HTML,
         mensaje=mensaje,
-        fecha_hoy=str(date.today())
+        fecha_hoy=str(date.today()),
+        barra_nav=generar_barra_nav('/registrar-venta')
     )
 
 
@@ -1743,10 +1789,11 @@ ASISTENTE_HTML = """
         .fila-entrada { display: flex; gap: 8px; margin-top: 16px; }
         #entrada { flex: 1; padding: 10px; font-size: 15px; }
         button { padding: 10px 16px; background: #FF9900; border: none; border-radius: 6px; font-size: 15px; }
+        """ + BARRA_NAV_CSS + """
     </style>
 </head>
 <body>
-    <a class="volver" href="/panel">&larr; Volver al panel</a>
+    {{ barra_nav|safe }}
     <div class="cabecera">
         <h1>Preguntale a tu negocio</h1>
         <button class="nueva-conversacion" onclick="nuevaConversacion()">Nueva conversacion</button>
@@ -1824,7 +1871,7 @@ ASISTENTE_HTML = """
 
 @app.route('/asistente')
 def asistente():
-    return render_template_string(ASISTENTE_HTML)
+    return render_template_string(ASISTENTE_HTML, barra_nav=generar_barra_nav('/asistente'))
 
 
 # =====================================================================
