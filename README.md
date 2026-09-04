@@ -1,3 +1,5 @@
+🌐 **English version:** [README.en.md](README.en.md)
+
 # Digitalización de facturas para microempresarios (AWS)
 
 Proyecto de portafolio construido como parte del estudio para las
@@ -10,8 +12,9 @@ sobre esos datos ya digitalizados.
 El proyecto se construyó en dos etapas. La **versión 1** (pipeline de
 captura y digitalización) quedó cerrada y verificada de punta a punta. La
 **versión 2**, construida sobre esa misma base, agregó un panel visual de
-indicadores y un asistente conversacional con IA generativa (Amazon
-Bedrock) para consultar los datos en lenguaje natural.
+indicadores, un asistente conversacional con IA generativa (Amazon
+Bedrock) para consultar los datos en lenguaje natural, edición manual de
+facturas y una interfaz rediseñada.
 
 ## Qué hace
 
@@ -20,8 +23,10 @@ Bedrock) para consultar los datos en lenguaje natural.
    mediante una URL prefirmada (nunca pasa por el servidor de la app).
 3. La subida a S3 dispara automáticamente una función AWS Lambda.
 4. La Lambda envía la imagen a Amazon Textract (`AnalyzeExpense`), que
-   extrae el proveedor, la fecha, el total y cada ítem de la factura, con
-   validaciones propias (no bloqueantes) de consistencia numérica.
+   extrae el proveedor, la fecha, el total y cada ítem de la factura —
+   junto con teléfono, dirección, número de factura y comprador cuando el
+   documento los trae — con validaciones propias (no bloqueantes) de
+   consistencia numérica.
 5. Los datos ya estructurados se guardan en una base de datos PostgreSQL
    (Amazon RDS).
 6. Un panel de consulta (`/facturas`) muestra todas las facturas procesadas,
@@ -29,17 +34,29 @@ Bedrock) para consultar los datos en lenguaje natural.
    alerta visible cuando la suma de los ítems no reconcilia con el total
    de la factura (con o sin impuesto), calculada al momento de mostrar el
    panel, así que aplica también a facturas ya procesadas.
-7. Un panel visual (`/panel`) resume el gasto (a partir de las facturas) y
+7. Un formulario de edición manual (`/facturas/<id>/editar`) permite
+   corregir cualquier campo de una factura ya procesada, para los casos en
+   que la extracción automática no acertó o el dato simplemente hacía
+   falta.
+8. Un panel visual (`/panel`) resume el gasto (a partir de las facturas) y
    la venta diaria (registrada manualmente) con indicadores y una gráfica
    de tendencia (Chart.js).
-8. Un asistente conversacional (`/asistente`), sobre Amazon Bedrock (Claude
+9. Un asistente conversacional (`/asistente`), sobre Amazon Bedrock (Claude
    Haiku 4.5 vía un perfil de inferencia global), responde preguntas en
    lenguaje natural sobre el gasto, la venta y las facturas — siempre
    ejecutando una de un conjunto fijo de consultas SQL predefinidas contra
    RDS, nunca inventando una cifra por sí mismo.
-9. El mismo asistente también responde por WhatsApp (`/whatsapp-webhook`),
-   como prueba de concepto sobre el Sandbox de Twilio, con su propio
-   historial de conversación por número de teléfono guardado en RDS.
+10. El mismo asistente también responde por WhatsApp (`/whatsapp-webhook`),
+    como prueba de concepto sobre el Sandbox de Twilio, con su propio
+    historial de conversación por número de teléfono guardado en RDS.
+
+## Interfaz
+
+Las 6 páginas de la aplicación comparten una misma navegación y un mismo
+sistema visual, construido con Tailwind CSS (vía CDN). El panel principal
+(`/`) y el listado de facturas (`/facturas`) están fusionados en un
+tablero de dos columnas tipo *bento grid*, en vez de vivir como pantallas
+separadas sin relación visual entre sí.
 
 ## Arquitectura
 
@@ -72,7 +89,7 @@ Bedrock) para consultar los datos en lenguaje natural.
 ## Estructura del repositorio
 
 ```
-app/                            Aplicación Flask (sube fotos, panel de consulta, panel visual y asistente conversacional)
+app/                            Aplicación Flask (sube fotos, panel de consulta, edición manual, panel visual y asistente conversacional)
 lambda/                         Función Lambda que llama a Textract, valida y guarda los datos en RDS
 docs/                           Diagramas de arquitectura, bitácora de la v2 y limitaciones conocidas
 ```
@@ -118,15 +135,17 @@ Antes de desplegar, necesitas:
 ## Limitaciones conocidas
 
 Ver [`docs/LIMITACIONES_CONOCIDAS.md`](docs/LIMITACIONES_CONOCIDAS.md) para
-el detalle de dos hallazgos de la etapa de extracción con Textract: un
+el detalle de tres hallazgos de la etapa de extracción con Textract: un
 defecto real ya corregido (símbolos de moneda y unidades en campos
-numéricos) y una limitación del servicio de OCR con recibos de formato de
-dos líneas por ítem, documentada y aceptada conscientemente en vez de
-resuelta.
+numéricos), una limitación del servicio de OCR con recibos de formato de
+dos líneas por ítem, y un caso de fecha no detectada en facturas
+manuscritas con casillas separadas (DÍA/MES/AÑO) — las dos últimas
+documentadas y aceptadas conscientemente en vez de resueltas, con la
+evidencia real que sustenta esa decisión en cada caso.
 
 ## Tecnologías
 
 AWS: VPC, EC2, Auto Scaling Group, Application Load Balancer, S3, Lambda,
 Textract, Bedrock, RDS (PostgreSQL), SSM Parameter Store, IAM.
 Backend: Python, Flask, boto3, pg8000, Twilio (canal de WhatsApp).
-Frontend: Chart.js (panel visual).
+Frontend: Tailwind CSS (interfaz), Chart.js (panel visual).
